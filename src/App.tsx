@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Home } from "./pages/Home";
 import { Recipes } from "./pages/Recipes";
 import { Install } from "./pages/Install";
@@ -6,6 +6,9 @@ import { History } from "./pages/History";
 import { Doctor } from "./pages/Doctor";
 import { Settings } from "./pages/Settings";
 import { api } from "./lib/api";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { cn } from "@/lib/utils";
 
 type Route = "home" | "recipes" | "install" | "history" | "doctor" | "settings";
 
@@ -23,19 +26,64 @@ export function App() {
   }, []);
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <h1>ClawPal</h1>
-        <nav>
-          <button className={route === "home" ? "active" : ""} onClick={() => setRoute("home")}>Home</button>
-          <button className={route === "recipes" || route === "install" ? "active" : ""} onClick={() => setRoute("recipes")}>Recipes</button>
-          <button className={route === "history" ? "active" : ""} onClick={() => setRoute("history")}>History</button>
-          <button className={route === "doctor" ? "active" : ""} onClick={() => setRoute("doctor")}>Doctor</button>
-          <div className="sidebar-divider" />
-          <button className={route === "settings" ? "active" : ""} onClick={() => setRoute("settings")}>Settings</button>
+    <div className="flex h-screen">
+      <aside className="w-[200px] min-w-[200px] bg-panel border-r border-border-subtle flex flex-col py-4">
+        <h1 className="px-4 text-lg font-bold text-text-main mb-4">ClawPal</h1>
+        <nav className="flex flex-col gap-1 px-2">
+          <Button
+            variant="ghost"
+            className={cn(
+              "justify-start text-text-main hover:bg-accent-blue/10",
+              (route === "home") && "bg-accent-blue/15 text-accent-blue border-l-[3px] border-accent-blue"
+            )}
+            onClick={() => setRoute("home")}
+          >
+            Home
+          </Button>
+          <Button
+            variant="ghost"
+            className={cn(
+              "justify-start text-text-main hover:bg-accent-blue/10",
+              (route === "recipes" || route === "install") && "bg-accent-blue/15 text-accent-blue border-l-[3px] border-accent-blue"
+            )}
+            onClick={() => setRoute("recipes")}
+          >
+            Recipes
+          </Button>
+          <Button
+            variant="ghost"
+            className={cn(
+              "justify-start text-text-main hover:bg-accent-blue/10",
+              (route === "history") && "bg-accent-blue/15 text-accent-blue border-l-[3px] border-accent-blue"
+            )}
+            onClick={() => setRoute("history")}
+          >
+            History
+          </Button>
+          <Button
+            variant="ghost"
+            className={cn(
+              "justify-start text-text-main hover:bg-accent-blue/10",
+              (route === "doctor") && "bg-accent-blue/15 text-accent-blue border-l-[3px] border-accent-blue"
+            )}
+            onClick={() => setRoute("doctor")}
+          >
+            Doctor
+          </Button>
+          <Separator className="my-2 bg-border-subtle" />
+          <Button
+            variant="ghost"
+            className={cn(
+              "justify-start text-text-main hover:bg-accent-blue/10",
+              (route === "settings") && "bg-accent-blue/15 text-accent-blue border-l-[3px] border-accent-blue"
+            )}
+            onClick={() => setRoute("settings")}
+          >
+            Settings
+          </Button>
         </nav>
       </aside>
-      <main className="content">
+      <main className="flex-1 overflow-y-auto p-4">
         {route === "home" && <Home />}
         {route === "recipes" && (
           <Recipes
@@ -60,12 +108,13 @@ export function App() {
         {route === "doctor" && <Doctor />}
         {route === "settings" && <Settings />}
         {route === "install" && (
-          <button
+          <Button
+            variant="ghost"
+            className="mt-3 text-text-main hover:bg-accent-blue/10"
             onClick={() => setRoute("recipes")}
-            style={{ marginTop: 12 }}
           >
             ← Recipes
-          </button>
+          </Button>
         )}
       </main>
     </div>
