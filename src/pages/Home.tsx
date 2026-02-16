@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { Chat } from "../components/Chat";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import type { StatusLight, AgentOverview, Recipe, HistoryItem } from "../lib/types";
 
 export function Home() {
@@ -45,119 +48,126 @@ export function Home() {
   }, []);
 
   return (
-    <div className="home-layout">
-      <div className="home-main">
-        <h2>Home</h2>
+    <div className="flex gap-4 h-full">
+      <div className="flex-1 overflow-y-auto">
+        <h2 className="text-2xl font-bold text-text-main mb-4">Home</h2>
 
         {/* Status Summary */}
-        <h3>Status</h3>
-        <div className="status-grid">
-          <div className="card">
-            <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>Health</div>
-            <div style={{ fontSize: "1.1rem", marginTop: 4 }}>
-              {status ? (status.healthy ? "Healthy" : "Unhealthy") : "..."}
-            </div>
-          </div>
-          <div className="card">
-            <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>OpenClaw Version</div>
-            <div style={{ fontSize: "1.1rem", marginTop: 4 }}>
-              {version || "..."}
-            </div>
-            {updateInfo?.available && (
-              <div style={{ marginTop: 4 }}>
-                <div style={{ color: "var(--accent)", fontSize: "0.85rem" }}>
-                  Update available: {updateInfo.latest}
-                </div>
-                <button
-                  style={{ marginTop: 6, fontSize: "0.8rem", padding: "4px 10px" }}
-                  onClick={() => api.openUrl("https://github.com/openclaw/openclaw/releases")}
-                >
-                  View update
-                </button>
+        <h3 className="text-lg font-semibold text-text-main mt-6 mb-3">Status</h3>
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
+          <Card className="bg-panel border-border-subtle">
+            <CardContent>
+              <div className="text-sm text-text-main/70">Health</div>
+              <div className="text-lg mt-1 text-text-main">
+                {status ? (status.healthy ? "Healthy" : "Unhealthy") : "..."}
               </div>
-            )}
-          </div>
-          <div className="card">
-            <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>Default Model</div>
-            <div style={{ fontSize: "1.1rem", marginTop: 4 }}>
-              {status ? (status.globalDefaultModel || "not set") : "..."}
-            </div>
-          </div>
+            </CardContent>
+          </Card>
+          <Card className="bg-panel border-border-subtle">
+            <CardContent>
+              <div className="text-sm text-text-main/70">OpenClaw Version</div>
+              <div className="text-lg mt-1 text-text-main">
+                {version || "..."}
+              </div>
+              {updateInfo?.available && (
+                <div className="mt-1">
+                  <div className="text-sm text-accent-blue mt-1">
+                    Update available: {updateInfo.latest}
+                  </div>
+                  <Button
+                    size="sm"
+                    className="mt-1.5 text-xs"
+                    onClick={() => api.openUrl("https://github.com/openclaw/openclaw/releases")}
+                  >
+                    View update
+                  </Button>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+          <Card className="bg-panel border-border-subtle">
+            <CardContent>
+              <div className="text-sm text-text-main/70">Default Model</div>
+              <div className="text-lg mt-1 text-text-main">
+                {status ? (status.globalDefaultModel || "not set") : "..."}
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
         {/* Agents Overview */}
-        <h3 style={{ marginTop: 24 }}>Agents</h3>
+        <h3 className="text-lg font-semibold text-text-main mt-6 mb-3">Agents</h3>
         {agents.length === 0 ? (
-          <p style={{ opacity: 0.6 }}>No agents found.</p>
+          <p className="text-text-main/60">No agents found.</p>
         ) : (
-          <div className="status-grid">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
             {agents.map((agent) => (
-              <div className="card" key={agent.id}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <strong>{agent.id}</strong>
-                  <span
-                    style={{
-                      fontSize: "0.8rem",
-                      padding: "2px 8px",
-                      borderRadius: 6,
-                      background: agent.online ? "rgba(80,200,120,0.18)" : "rgba(255,107,107,0.15)",
-                      color: agent.online ? "#50c878" : "#ff6b6b",
-                    }}
-                  >
-                    {agent.online ? "online" : "offline"}
-                  </span>
-                </div>
-                <div style={{ opacity: 0.7, fontSize: "0.85rem", marginTop: 6 }}>
-                  Model: {agent.model || "default"}
-                </div>
-              </div>
+              <Card className="bg-panel border-border-subtle" key={agent.id}>
+                <CardContent>
+                  <div className="flex justify-between items-center">
+                    <strong>{agent.id}</strong>
+                    {agent.online ? (
+                      <Badge className="bg-success-green/20 text-success-green border-0">online</Badge>
+                    ) : (
+                      <Badge className="bg-destructive-red/15 text-destructive-red border-0">offline</Badge>
+                    )}
+                  </div>
+                  <div className="text-sm text-text-main/70 mt-1.5">
+                    Model: {agent.model || "default"}
+                  </div>
+                </CardContent>
+              </Card>
             ))}
           </div>
         )}
 
         {/* Recommended Recipes */}
-        <h3 style={{ marginTop: 24 }}>Recommended Recipes</h3>
+        <h3 className="text-lg font-semibold text-text-main mt-6 mb-3">Recommended Recipes</h3>
         {recipes.length === 0 ? (
-          <p style={{ opacity: 0.6 }}>No recipes available.</p>
+          <p className="text-text-main/60">No recipes available.</p>
         ) : (
-          <div className="status-grid">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
             {recipes.map((recipe) => (
-              <div className="card" key={recipe.id}>
-                <strong>{recipe.name}</strong>
-                <div style={{ opacity: 0.8, fontSize: "0.9rem", marginTop: 6 }}>
-                  {recipe.description}
-                </div>
-                <div style={{ opacity: 0.6, fontSize: "0.8rem", marginTop: 8 }}>
-                  {recipe.difficulty} &middot; {recipe.impactCategory}
-                </div>
-              </div>
+              <Card className="bg-panel border-border-subtle" key={recipe.id}>
+                <CardContent>
+                  <strong>{recipe.name}</strong>
+                  <div className="text-sm text-text-main/80 mt-1.5">
+                    {recipe.description}
+                  </div>
+                  <div className="text-xs text-text-main/60 mt-2">
+                    {recipe.difficulty} &middot; {recipe.impactCategory}
+                  </div>
+                </CardContent>
+              </Card>
             ))}
           </div>
         )}
 
         {/* Recent Activity */}
-        <h3 style={{ marginTop: 24 }}>Recent Activity</h3>
+        <h3 className="text-lg font-semibold text-text-main mt-6 mb-3">Recent Activity</h3>
         {history.length === 0 ? (
-          <p style={{ opacity: 0.6 }}>No recent activity.</p>
+          <p className="text-text-main/60">No recent activity.</p>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div className="flex flex-col gap-2">
             {history.map((item) => (
-              <div className="card" key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <span style={{ fontWeight: 500 }}>{item.recipeId || "manual change"}</span>
-                  <span style={{ opacity: 0.6, marginLeft: 10, fontSize: "0.85rem" }}>
-                    {item.source}
-                  </span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  {item.canRollback && (
-                    <span style={{ fontSize: "0.8rem", opacity: 0.6 }}>rollback available</span>
-                  )}
-                  <span style={{ opacity: 0.5, fontSize: "0.85rem" }}>
-                    {item.createdAt}
-                  </span>
-                </div>
-              </div>
+              <Card className="bg-panel border-border-subtle" key={item.id}>
+                <CardContent className="flex justify-between items-center">
+                  <div>
+                    <span className="font-medium">{item.recipeId || "manual change"}</span>
+                    <span className="text-sm text-text-main/60 ml-2.5">
+                      {item.source}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2.5">
+                    {item.canRollback && (
+                      <span className="text-xs text-text-main/60">rollback available</span>
+                    )}
+                    <span className="text-sm text-text-main/50">
+                      {item.createdAt}
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
             ))}
           </div>
         )}
