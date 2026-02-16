@@ -1,0 +1,305 @@
+use std::{env, fs, path::{Path, PathBuf}};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+const BUILTIN_RECIPES_JSON: &str = include_str!("../recipes.json");
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RecipeDocument {
+    List(Vec<Recipe>),
+    Wrapped { recipes: Vec<Recipe> },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeParam {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub required: bool,
+    pub pattern: Option<String>,
+    pub min_length: Option<usize>,
+    pub max_length: Option<usize>,
+    pub placeholder: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Recipe {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub tags: Vec<String>,
+    pub difficulty: String,
+    pub params: Vec<RecipeParam>,
+    pub patch_template: String,
+    pub impact_category: String,
+    pub impact_summary: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChangeItem {
+    pub path: String,
+    pub op: String,
+    pub risk: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreviewResult {
+    pub recipe_id: String,
+    pub diff: String,
+    pub changes: Vec<ChangeItem>,
+    pub overwrites_existing: bool,
+    pub can_rollback: bool,
+    pub impact_level: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApplyResult {
+    pub ok: bool,
+    pub snapshot_id: Option<String>,
+    pub config_path: String,
+    pub backup_path: Option<String>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+pub fn builtin_recipes() -> Vec<Recipe> {
+    parse_recipes_document(BUILTIN_RECIPES_JSON).unwrap_or_else(|_| Vec::new())
+}
+
+fn is_http_url(candidate: &str) -> bool {
+    candidate.starts_with("http://") || candidate.starts_with("https://")
+}
+
+fn expand_user_path(candidate: &str) -> PathBuf {
+    if let Some(rest) = candidate.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(candidate)
+}
+
+fn parse_recipes_document(text: &str) -> Result<Vec<Recipe>, String> {
+    let document: RecipeDocument = json5::from_str(text).map_err(|e| e.to_string())?;
+    match document {
+        RecipeDocument::List(recipes) => Ok(recipes),
+        RecipeDocument::Wrapped { recipes } => Ok(recipes),
+    }
+}
+
+pub fn load_recipes_from_source(source: &str) -> Result<Vec<Recipe>, String> {
+    if source.trim().is_empty() {
+        return Err("empty recipe source".into());
+    }
+
+    if is_http_url(source) {
+        let response = reqwest::blocking::get(source).map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("request failed: {}", response.status()));
+        }
+        let text = response.text().map_err(|e| e.to_string())?;
+        parse_recipes_document(&text)
+    } else {
+        let path = expand_user_path(source);
+        let path = Path::new(&path);
+        if !path.exists() {
+            return Err(format!("recipe file not found: {}", path.to_string_lossy()));
+        }
+        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        parse_recipes_document(&text)
+    }
+}
+
+pub fn load_recipes_with_fallback(
+    explicit_source: Option<String>,
+    default_path: &Path,
+) -> Vec<Recipe> {
+    let builtin = builtin_recipes();
+
+    let candidates = [
+        explicit_source,
+        env::var("CLAWPAL_RECIPES_SOURCE").ok(),
+        Some(default_path.to_string_lossy().to_string()),
+    ];
+
+    for candidate in candidates.iter().flatten() {
+        if candidate.trim().is_empty() {
+            continue;
+        }
+        if let Ok(recipes) = load_recipes_from_source(candidate) {
+            if !recipes.is_empty() {
+                return recipes;
+            }
+        }
+    }
+
+    builtin
+}
+
+pub fn find_recipe(id: &str) -> Option<Recipe> {
+    find_recipe_with_source(id, None)
+}
+
+pub fn find_recipe_with_source(id: &str, source: Option<String>) -> Option<Recipe> {
+    let paths = crate::models::resolve_paths();
+    let default_path = paths.clawpal_dir.join("recipes").join("recipes.json");
+    load_recipes_with_fallback(source, &default_path)
+        .into_iter()
+        .find(|r| r.id == id)
+}
+
+pub fn validate(recipe: &Recipe, params: &Map<String, Value>) -> Vec<String> {
+    let mut errors = Vec::new();
+    for p in &recipe.params {
+        if p.required && !params.contains_key(&p.id) {
+            errors.push(format!("missing required param: {}", p.id));
+            continue;
+        }
+
+        if let Some(v) = params.get(&p.id) {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                _ => {
+                    errors.push(format!("param {} must be string", p.id));
+                    continue;
+                }
+            };
+            if let Some(min) = p.min_length {
+                if s.len() < min {
+                    errors.push(format!("param {} too short", p.id));
+                }
+            }
+            if let Some(max) = p.max_length {
+                if s.len() > max {
+                    errors.push(format!("param {} too long", p.id));
+                }
+            }
+            if let Some(pattern) = &p.pattern {
+                let re = Regex::new(pattern).map_err(|e| e.to_string()).ok();
+                if let Some(re) = re {
+                    if !re.is_match(&s) {
+                        errors.push(format!("param {} not match pattern", p.id));
+                    }
+                } else {
+                    errors.push("invalid validation pattern".into());
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn render_patch_template(template: &str, params: &Map<String, Value>) -> String {
+    let mut text = template.to_string();
+    for (k, v) in params {
+        let placeholder = format!("{{{{{}}}}}", k);
+        let replacement = match v {
+            Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        };
+        text = text.replace(&placeholder, &replacement);
+    }
+    text
+}
+
+pub fn build_candidate_config(
+    current: &Value,
+    recipe: &Recipe,
+    params: &Map<String, Value>,
+) -> Result<(Value, Vec<ChangeItem>), String> {
+    let rendered = render_patch_template(&recipe.patch_template, params);
+    let patch: Value = json5::from_str(&rendered).map_err(|e| e.to_string())?;
+
+    let mut merged = current.clone();
+    let mut changes = Vec::new();
+    apply_merge_patch(&mut merged, &patch, "", &mut changes);
+    if recipe.impact_category == "high" {
+        for change in &mut changes {
+            change.risk = "high".into();
+        }
+    }
+    Ok((merged, changes))
+}
+
+fn apply_merge_patch(target: &mut Value, patch: &Value, prefix: &str, changes: &mut Vec<ChangeItem>) {
+    if patch.is_object() && target.is_object() {
+        let t = target.as_object_mut().unwrap();
+        for (k, pv) in patch.as_object().unwrap() {
+            let path = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{}.{}", prefix, k)
+            };
+            match pv {
+                Value::Null => {
+                    if t.remove(k).is_some() {
+                        changes.push(ChangeItem {
+                            path: path.clone(),
+                            op: "remove".into(),
+                            risk: "medium".into(),
+                            reason: None,
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(tv) = t.get_mut(k) {
+                        if tv.is_object() && pv.is_object() {
+                            apply_merge_patch(tv, pv, &path, changes);
+                        } else {
+                            *tv = pv.clone();
+                            changes.push(ChangeItem {
+                                path,
+                                op: "replace".into(),
+                                risk: "low".into(),
+                                reason: None,
+                            });
+                        }
+                    } else {
+                        t.insert(k.clone(), pv.clone());
+                        changes.push(ChangeItem {
+                            path,
+                            op: "add".into(),
+                            risk: "low".into(),
+                            reason: None,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        *target = patch.clone();
+        changes.push(ChangeItem {
+            path: prefix.to_string(),
+            op: "replace".into(),
+            risk: "medium".into(),
+            reason: None,
+        });
+    }
+}
+
+pub fn collect_change_paths(current: &Value, patched: &Value) -> Vec<ChangeItem> {
+    if current == patched {
+        Vec::new()
+    } else {
+        vec![ChangeItem {
+            path: "root".to_string(),
+            op: "replace".to_string(),
+            risk: "medium".to_string(),
+            reason: None,
+        }]
+    }
+}
+
+pub fn format_diff(before: &Value, after: &Value) -> String {
+    let before_text = serde_json::to_string_pretty(before).unwrap_or_else(|_| "{}".into());
+    let after_text = serde_json::to_string_pretty(after).unwrap_or_else(|_| "{}".into());
+    format!("before:\n{}\n\nafter:\n{}", before_text, after_text)
+}

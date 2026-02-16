@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "identifier": "xyz.clawpal",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ClawPal",
+        "width": 1200,
+        "height": 820,
+        "minWidth": 1024,
+        "minHeight": 680
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "icon": [],
+    "targets": ["deb", "dmg", "msi"]
+  }
+}

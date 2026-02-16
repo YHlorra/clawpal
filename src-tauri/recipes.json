@@ -1,0 +1,66 @@
+{
+  "recipes": [
+    {
+      "id": "discord-channel-persona",
+      "name": "Discord channel persona",
+      "description": "Inject different system prompt for one Discord channel",
+      "version": "1.0.0",
+      "tags": ["discord", "persona", "beginner"],
+      "difficulty": "easy",
+      "params": [
+        {
+          "id": "guild_id",
+          "label": "Guild ID",
+          "type": "string",
+          "required": true,
+          "pattern": "^[0-9]+$",
+          "minLength": 17,
+          "maxLength": 20,
+          "placeholder": "Copy guild id"
+        },
+        {
+          "id": "channel_id",
+          "label": "Channel ID",
+          "type": "string",
+          "required": true,
+          "pattern": "^[0-9]+$",
+          "minLength": 17,
+          "maxLength": 20,
+          "placeholder": "Copy channel id"
+        },
+        {
+          "id": "persona",
+          "label": "Persona",
+          "type": "textarea",
+          "required": true,
+          "minLength": 1,
+          "placeholder": "You are..."
+        }
+      ],
+      "patchTemplate": "\n{\n  \"channels\": {\n    \"discord\": {\n      \"guilds\": {\n        \"{{guild_id}}\": {\n          \"channels\": {\n            \"{{channel_id}}\": {\n              \"systemPrompt\": \"{{persona}}\"\n            }\n          }\n        }\n      }\n    }\n  }\n}",
+      "impactCategory": "low",
+      "impactSummary": "Add/modify channel persona"
+    },
+    {
+      "id": "model-switch",
+      "name": "Model switch",
+      "description": "Quickly switch default model",
+      "version": "1.0.0",
+      "tags": ["model", "productivity"],
+      "difficulty": "easy",
+      "params": [
+        {
+          "id": "model_name",
+          "label": "Model name",
+          "type": "string",
+          "required": true,
+          "minLength": 1,
+          "placeholder": "gpt-4o"
+        }
+      ],
+      "patchTemplate": "\n{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"{{model_name}}\"\n    }\n  }\n}",
+      "impactCategory": "low",
+      "impactSummary": "Switch default model"
+    }
+  ]
+}
