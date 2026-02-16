@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 interface Message {
   role: "user" | "assistant";
@@ -76,54 +87,57 @@ export function Chat() {
   }, [input, loading, agentId, sessionId]);
 
   return (
-    <div className="home-chat">
-      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 8px" }}>
-        <h3 style={{ margin: 0 }}>Chat</h3>
-        <select
-          value={agentId}
-          onChange={(e) => { const a = e.target.value; setAgentId(a); setSessionId(loadSessionId(a)); setMessages([]); }}
-          style={{ fontSize: "0.8rem", padding: "2px 6px" }}
-        >
-          {agents.map((a) => (
-            <option key={a} value={a}>{a}</option>
-          ))}
-        </select>
-        <button
-          type="button"
+    <div className="w-[340px] min-w-[300px] flex flex-col border-l border-border-subtle pl-4">
+      <div className="flex items-center gap-2 mb-2">
+        <h3 className="text-lg font-semibold text-text-main m-0">Chat</h3>
+        <Select value={agentId} onValueChange={(a) => { setAgentId(a); setSessionId(loadSessionId(a)); setMessages([]); }}>
+          <SelectTrigger className="w-auto h-7 text-xs bg-panel border-border-subtle text-text-main">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent className="bg-panel border-border-subtle">
+            {agents.map((a) => (
+              <SelectItem key={a} value={a} className="text-text-main">{a}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-xs opacity-70 text-text-main"
           onClick={() => { clearSessionId(agentId); setSessionId(undefined); setMessages([]); }}
-          style={{ fontSize: "0.75rem", padding: "2px 8px", opacity: 0.7 }}
         >
           New
-        </button>
+        </Button>
       </div>
-      <div style={{ flex: 1, overflowY: "auto", marginBottom: 8 }}>
+      <ScrollArea className="flex-1 mb-2">
         {messages.map((msg, i) => (
-          <div key={i} style={{ marginBottom: 8, textAlign: msg.role === "user" ? "right" : "left" }}>
-            <div style={{
-              display: "inline-block",
-              background: msg.role === "user" ? "#2d3560" : "var(--panel)",
-              padding: "8px 12px",
-              borderRadius: 8,
-              maxWidth: "90%",
-              textAlign: "left",
-              border: "1px solid #29325a",
-            }}>
-              <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9rem" }}>{msg.content}</div>
+          <div key={i} className={cn("mb-2", msg.role === "user" ? "text-right" : "text-left")}>
+            <div className={cn(
+              "inline-block px-3 py-2 rounded-lg max-w-[90%] text-left border border-border-subtle",
+              msg.role === "user" ? "bg-btn-border" : "bg-panel"
+            )}>
+              <div className="whitespace-pre-wrap text-sm text-text-main">{msg.content}</div>
             </div>
           </div>
         ))}
-        {loading && <div style={{ opacity: 0.5, fontSize: "0.9rem" }}>Thinking...</div>}
+        {loading && <div className="opacity-50 text-sm">Thinking...</div>}
         <div ref={bottomRef} />
-      </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <input
+      </ScrollArea>
+      <div className="flex gap-2">
+        <Input
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
           placeholder="Ask your OpenClaw agent..."
-          style={{ flex: 1 }}
+          className="flex-1 bg-panel border-border-subtle text-text-main"
         />
-        <button onClick={send} disabled={loading}>Send</button>
+        <Button
+          className="bg-btn-bg border border-btn-border text-text-main hover:bg-accent-blue/15"
+          onClick={send}
+          disabled={loading}
+        >
+          Send
+        </Button>
       </div>
     </div>
   );
