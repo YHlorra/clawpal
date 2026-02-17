@@ -216,6 +216,14 @@ pub struct DiscordGuildChannel {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderAuthSuggestion {
+    pub auth_ref: Option<String>,
+    pub has_key: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelBinding {
     pub scope: String,
     pub scope_id: String,
@@ -232,6 +240,8 @@ pub struct HistoryItem {
     pub created_at: String,
     pub source: String,
     pub can_rollback: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_of: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -257,6 +267,8 @@ pub struct AgentOverview {
     pub model: Option<String>,
     pub channels: Vec<String>,
     pub online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -267,7 +279,7 @@ pub struct StatusLight {
     pub global_default_model: Option<String>,
 }
 
-/// Fast status: only reads config file, no subprocesses or FS traversals.
+/// Fast status: reads config + quick TCP probe of gateway port.
 #[tauri::command]
 pub fn get_status_light() -> Result<StatusLight, String> {
     let paths = resolve_paths();
@@ -282,8 +294,18 @@ pub fn get_status_light() -> Result<StatusLight, String> {
         .pointer("/agents/defaults/model")
         .and_then(read_model_value)
         .or_else(|| cfg.pointer("/agents/default/model").and_then(read_model_value));
+
+    // Quick gateway health: TCP connect to gateway port
+    let gateway_port = cfg.pointer("/gateway/port")
+        .and_then(Value::as_u64)
+        .unwrap_or(8080) as u16;
+    let healthy = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], gateway_port)),
+        std::time::Duration::from_millis(500),
+    ).is_ok();
+
     Ok(StatusLight {
-        healthy: true,
+        healthy,
         active_agents,
         global_default_model,
     })
@@ -455,7 +477,27 @@ pub fn upsert_model_profile(mut profile: ModelProfile) -> Result<ModelProfile, S
     }
     let has_api_key = profile.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
     if profile.auth_ref.trim().is_empty() && !has_api_key {
-        return Err("API key or auth env var is required".into());
+        // Auto-resolve auth ref from openclaw config or env vars
+        let paths_tmp = resolve_paths();
+        if let Ok(cfg) = read_openclaw_config(&paths_tmp) {
+            if let Some(auth_ref) = resolve_auth_ref_for_provider(&cfg, &profile.provider) {
+                profile.auth_ref = auth_ref;
+            }
+        }
+        if profile.auth_ref.trim().is_empty() {
+            // Try env var convention
+            let provider_upper = profile.provider.trim().to_uppercase().replace('-', "_");
+            for suffix in ["_API_KEY", "_KEY", "_TOKEN"] {
+                let env_name = format!("{provider_upper}{suffix}");
+                if std::env::var(&env_name).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                    profile.auth_ref = env_name;
+                    break;
+                }
+            }
+        }
+        if profile.auth_ref.trim().is_empty() {
+            return Err("API key or auth env var is required".into());
+        }
     }
     let paths = resolve_paths();
     let mut profiles = load_model_profiles(&paths);
@@ -483,6 +525,60 @@ pub fn delete_model_profile(profile_id: String) -> Result<bool, String> {
     }
     save_model_profiles(&paths, &profiles)?;
     Ok(true)
+}
+
+#[tauri::command]
+pub fn resolve_provider_auth(provider: String) -> Result<ProviderAuthSuggestion, String> {
+    let provider_trimmed = provider.trim();
+    if provider_trimmed.is_empty() {
+        return Ok(ProviderAuthSuggestion { auth_ref: None, has_key: false, source: String::new() });
+    }
+    let paths = resolve_paths();
+    let cfg = read_openclaw_config(&paths)?;
+
+    // 1. Check openclaw config auth profiles
+    if let Some(auth_ref) = resolve_auth_ref_for_provider(&cfg, provider_trimmed) {
+        return Ok(ProviderAuthSuggestion {
+            auth_ref: Some(auth_ref),
+            has_key: true,
+            source: "openclaw auth profile".into(),
+        });
+    }
+
+    // 2. Check env vars
+    let provider_upper = provider_trimmed.to_uppercase().replace('-', "_");
+    for suffix in ["_API_KEY", "_KEY", "_TOKEN"] {
+        let env_name = format!("{provider_upper}{suffix}");
+        if std::env::var(&env_name).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            return Ok(ProviderAuthSuggestion {
+                auth_ref: Some(env_name),
+                has_key: true,
+                source: "environment variable".into(),
+            });
+        }
+    }
+
+    // 3. Check existing model profiles for this provider
+    let profiles = load_model_profiles(&paths);
+    for p in &profiles {
+        if p.provider.eq_ignore_ascii_case(provider_trimmed) {
+            let key = resolve_profile_api_key(p, &paths.base_dir);
+            if !key.is_empty() {
+                let auth_ref = if !p.auth_ref.trim().is_empty() {
+                    Some(p.auth_ref.clone())
+                } else {
+                    None
+                };
+                return Ok(ProviderAuthSuggestion {
+                    auth_ref,
+                    has_key: true,
+                    source: format!("existing profile {}/{}", p.provider, p.model),
+                });
+            }
+        }
+    }
+
+    Ok(ProviderAuthSuggestion { auth_ref: None, has_key: false, source: String::new() })
 }
 
 #[tauri::command]
@@ -613,6 +709,83 @@ pub fn update_channel_config(
     Ok(true)
 }
 
+/// List current channel→agent bindings from config.
+#[tauri::command]
+pub fn list_bindings() -> Result<Vec<Value>, String> {
+    let paths = resolve_paths();
+    let cfg = read_openclaw_config(&paths)?;
+    let bindings = cfg
+        .get("bindings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(bindings)
+}
+
+/// Assign a Discord channel to an agent (modifies the `bindings` array).
+/// Pass `agent_id = None` or empty to remove the binding (revert to default agent).
+#[tauri::command]
+pub fn assign_channel_agent(
+    channel_type: String,
+    peer_id: String,
+    agent_id: Option<String>,
+) -> Result<bool, String> {
+    let paths = resolve_paths();
+    let mut cfg = read_openclaw_config(&paths)?;
+    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+
+    let bindings = cfg
+        .get_mut("bindings")
+        .and_then(Value::as_array_mut);
+
+    let agent_id = agent_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(arr) = bindings {
+        // Remove existing binding for this peer
+        arr.retain(|b| {
+            let m = b.get("match");
+            let ch = m.and_then(|m| m.get("channel")).and_then(Value::as_str);
+            let pid = m.and_then(|m| m.pointer("/peer/id")).and_then(Value::as_str);
+            !(ch == Some(&channel_type) && pid == Some(&peer_id))
+        });
+
+        // Add new binding if agent_id is provided
+        if let Some(ref aid) = agent_id {
+            arr.push(serde_json::json!({
+                "agentId": aid,
+                "match": {
+                    "channel": channel_type,
+                    "peer": {
+                        "id": peer_id,
+                        "kind": "channel"
+                    }
+                }
+            }));
+        }
+    } else if let Some(ref aid) = agent_id {
+        // No bindings array yet — create one
+        cfg.as_object_mut()
+            .ok_or("config is not an object")?
+            .insert("bindings".into(), serde_json::json!([
+                {
+                    "agentId": aid,
+                    "match": {
+                        "channel": channel_type,
+                        "peer": {
+                            "id": peer_id,
+                            "kind": "channel"
+                        }
+                    }
+                }
+            ]));
+    }
+
+    write_config_with_snapshot(&paths, &current, &cfg, "assign-channel-agent")?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn delete_channel_node(path: String) -> Result<bool, String> {
     if path.trim().is_empty() {
@@ -693,6 +866,7 @@ pub fn list_agents_overview() -> Result<Vec<AgentOverview>, String> {
     let paths = resolve_paths();
     let cfg = read_openclaw_config(&paths)?;
     let mut agents = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
 
     let default_workspace = cfg.pointer("/agents/defaults/workspace")
         .and_then(Value::as_str)
@@ -703,12 +877,17 @@ pub fn list_agents_overview() -> Result<Vec<AgentOverview>, String> {
         for agent in list {
             let id = agent.get("id").and_then(Value::as_str).unwrap_or("agent").to_string();
 
+            // Deduplicate by ID
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+
             // Read name/emoji from IDENTITY.md in the agent's workspace
             let workspace = agent.get("workspace").and_then(Value::as_str)
                 .map(|s| expand_tilde(s))
                 .or_else(|| default_workspace.clone());
-            let (name, emoji) = workspace
-                .and_then(|ws| parse_identity_md(&ws))
+            let (name, emoji) = workspace.as_ref()
+                .and_then(|ws| parse_identity_md(ws))
                 .unwrap_or((None, None));
 
             let model = agent.get("model").and_then(read_model_value)
@@ -725,10 +904,182 @@ pub fn list_agents_overview() -> Result<Vec<AgentOverview>, String> {
                 model,
                 channels,
                 online: has_sessions,
+                workspace,
             });
         }
     }
     Ok(agents)
+}
+
+#[tauri::command]
+pub fn create_agent(
+    agent_id: String,
+    model_profile_id: Option<String>,
+    independent: Option<bool>,
+) -> Result<AgentOverview, String> {
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return Err("Agent ID is required".into());
+    }
+    if !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err("Agent ID may only contain letters, numbers, hyphens, and underscores".into());
+    }
+
+    let paths = resolve_paths();
+    let mut cfg = read_openclaw_config(&paths)?;
+    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+
+    let existing_ids = collect_agent_ids(&cfg);
+    if existing_ids.iter().any(|id| id.eq_ignore_ascii_case(&agent_id)) {
+        return Err(format!("Agent '{}' already exists", agent_id));
+    }
+
+    // Resolve model value from profile if provided
+    let model_value = if let Some(ref pid) = model_profile_id {
+        let pid = pid.trim();
+        if pid.is_empty() { None } else {
+            Some(resolve_profile_model_value(&paths, Some(pid.to_string()))?)
+        }
+    } else { None };
+    let model_display = model_value.flatten();
+
+    // If independent, create a workspace directory for this agent
+    let workspace = if independent.unwrap_or(false) {
+        let ws_dir = paths.base_dir.join("workspaces").join(&agent_id);
+        fs::create_dir_all(&ws_dir).map_err(|e| e.to_string())?;
+        let ws_path = ws_dir.to_string_lossy().to_string();
+        Some(ws_path)
+    } else { None };
+
+    // Build agent entry
+    let mut agent_obj = serde_json::Map::new();
+    agent_obj.insert("id".into(), Value::String(agent_id.clone()));
+    if let Some(ref model_str) = model_display {
+        agent_obj.insert("model".into(), Value::String(model_str.clone()));
+    }
+    if let Some(ref ws) = workspace {
+        agent_obj.insert("workspace".into(), Value::String(ws.clone()));
+    }
+
+    let agents = cfg
+        .as_object_mut()
+        .ok_or("config is not an object")?
+        .entry("agents")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or("agents is not an object")?;
+    let list = agents
+        .entry("list")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("agents.list is not an array")?;
+    list.push(Value::Object(agent_obj));
+
+    write_config_with_snapshot(&paths, &current, &cfg, "create-agent")?;
+    Ok(AgentOverview {
+        id: agent_id,
+        name: None,
+        emoji: None,
+        model: model_display,
+        channels: vec![],
+        online: false,
+        workspace,
+    })
+}
+
+#[tauri::command]
+pub fn delete_agent(agent_id: String) -> Result<bool, String> {
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return Err("Agent ID is required".into());
+    }
+    if agent_id == "main" {
+        return Err("Cannot delete the main agent".into());
+    }
+
+    let paths = resolve_paths();
+    let mut cfg = read_openclaw_config(&paths)?;
+    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+
+    let list = cfg
+        .pointer_mut("/agents/list")
+        .and_then(Value::as_array_mut)
+        .ok_or("agents.list not found")?;
+
+    let before = list.len();
+    list.retain(|agent| {
+        agent.get("id").and_then(Value::as_str) != Some(&agent_id)
+    });
+
+    if list.len() == before {
+        return Err(format!("Agent '{}' not found", agent_id));
+    }
+
+    // Also remove any bindings that reference this agent
+    if let Some(bindings) = cfg.pointer_mut("/bindings").and_then(Value::as_array_mut) {
+        bindings.retain(|b| {
+            b.get("agentId").and_then(Value::as_str) != Some(&agent_id)
+        });
+    }
+
+    write_config_with_snapshot(&paths, &current, &cfg, "delete-agent")?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn setup_agent_identity(
+    agent_id: String,
+    name: String,
+    emoji: Option<String>,
+) -> Result<bool, String> {
+    let agent_id = agent_id.trim().to_string();
+    let name = name.trim().to_string();
+    if agent_id.is_empty() {
+        return Err("Agent ID is required".into());
+    }
+    if name.is_empty() {
+        return Err("Name is required".into());
+    }
+
+    let paths = resolve_paths();
+    let cfg = read_openclaw_config(&paths)?;
+
+    // Find the agent's workspace
+    let agents_list = cfg.pointer("/agents/list")
+        .and_then(Value::as_array)
+        .ok_or("agents.list not found")?;
+
+    let agent = agents_list.iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(&agent_id))
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+
+    let default_workspace = cfg.pointer("/agents/defaults/workspace")
+        .or_else(|| cfg.pointer("/agents/default/workspace"))
+        .and_then(Value::as_str)
+        .map(|s| expand_tilde(s));
+
+    let workspace = agent.get("workspace")
+        .and_then(Value::as_str)
+        .map(|s| expand_tilde(s))
+        .or(default_workspace)
+        .ok_or_else(|| format!("Agent '{}' has no workspace configured", agent_id))?;
+
+    // Build IDENTITY.md content
+    let mut content = format!("- Name: {}\n", name);
+    if let Some(ref e) = emoji {
+        let e = e.trim();
+        if !e.is_empty() {
+            content.push_str(&format!("- Emoji: {}\n", e));
+        }
+    }
+
+    let ws_path = std::path::Path::new(&workspace);
+    fs::create_dir_all(ws_path).map_err(|e| format!("Failed to create workspace dir: {}", e))?;
+    let identity_path = ws_path.join("IDENTITY.md");
+    fs::write(&identity_path, &content)
+        .map_err(|e| format!("Failed to write IDENTITY.md: {}", e))?;
+
+    Ok(true)
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -904,6 +1255,7 @@ pub fn apply_recipe(
         "apply",
         true,
         &current_text,
+        None,
     )?;
     let (candidate, _changes) = build_candidate_config(&current, &recipe, &params)?;
     write_json(&paths.config_path, &candidate)?;
@@ -940,6 +1292,7 @@ pub fn list_history(limit: usize, offset: usize) -> Result<HistoryPage, String> 
             created_at: item.created_at,
             source: item.source,
             can_rollback: item.can_rollback,
+            rollback_of: item.rollback_of,
         })
         .collect();
     Ok(HistoryPage { items })
@@ -995,10 +1348,11 @@ pub fn rollback(snapshot_id: String) -> Result<ApplyResult, String> {
     let _ = add_snapshot(
         &paths.history_dir,
         &paths.metadata_path,
-        Some("rollback".into()),
+        target.recipe_id.clone(),
         "rollback",
         true,
         &backup_text,
+        Some(target.id.clone()),
     )?;
     write_text(&paths.config_path, &target_text)?;
     Ok(ApplyResult {
@@ -2061,6 +2415,7 @@ fn write_config_with_snapshot(
         source,
         true,
         current_text,
+        None,
     )?;
     write_json(&paths.config_path, next)
 }
@@ -2818,6 +3173,93 @@ pub fn read_raw_config() -> Result<String, String> {
     let paths = resolve_paths();
     let cfg = read_openclaw_config(&paths)?;
     serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())
+}
+
+// ---- Config baseline for dirty tracking ----
+
+fn baseline_path(paths: &crate::models::OpenClawPaths) -> std::path::PathBuf {
+    paths.clawpal_dir.join("config-baseline.json")
+}
+
+#[tauri::command]
+pub fn save_config_baseline() -> Result<bool, String> {
+    let paths = resolve_paths();
+    let cfg = read_openclaw_config(&paths)?;
+    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    let bp = baseline_path(&paths);
+    fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&bp, text).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigDirtyState {
+    pub dirty: bool,
+    pub baseline: String,
+    pub current: String,
+}
+
+#[tauri::command]
+pub fn check_config_dirty() -> Result<ConfigDirtyState, String> {
+    let paths = resolve_paths();
+    let cfg = read_openclaw_config(&paths)?;
+    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    let bp = baseline_path(&paths);
+    let baseline = if bp.exists() {
+        fs::read_to_string(&bp).map_err(|e| e.to_string())?
+    } else {
+        // No baseline yet — treat current as clean, save it
+        fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&bp, &current).map_err(|e| e.to_string())?;
+        current.clone()
+    };
+    let dirty = baseline.trim() != current.trim();
+    Ok(ConfigDirtyState { dirty, baseline, current })
+}
+
+#[tauri::command]
+pub fn discard_config_changes() -> Result<bool, String> {
+    let paths = resolve_paths();
+    let bp = baseline_path(&paths);
+    if !bp.exists() {
+        return Err("No baseline config found".into());
+    }
+    let baseline_text = fs::read_to_string(&bp).map_err(|e| e.to_string())?;
+    let baseline: Value = serde_json::from_str(&baseline_text).map_err(|e| e.to_string())?;
+
+    // Save current as snapshot before discarding
+    let cfg = read_openclaw_config(&paths)?;
+    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    let _ = add_snapshot(
+        &paths.history_dir,
+        &paths.metadata_path,
+        None,
+        "discard-changes",
+        true,
+        &current_text,
+        None,
+    );
+
+    write_json(&paths.config_path, &baseline)?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn apply_pending_changes() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = resolve_paths();
+        // Save current config as new baseline
+        let cfg = read_openclaw_config(&paths)?;
+        let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+        let bp = baseline_path(&paths);
+        fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&bp, &text).map_err(|e| e.to_string())?;
+
+        // Restart gateway
+        run_openclaw_raw(&["gateway", "restart"])?;
+        Ok(true)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

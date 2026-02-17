@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
-import type { DiscordGuildChannel, Recipe, RecipeParam } from "../lib/types";
+import { useEffect, useMemo, useState } from "react";
+import type { AgentOverview, DiscordGuildChannel, ModelProfile, Recipe, RecipeParam } from "../lib/types";
+import { api } from "../lib/api";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -18,7 +19,7 @@ function validateField(param: RecipeParam, value: string): string | null {
     return `${param.label} is required`;
   }
   // Select-based types only need required check
-  if (param.type === "discord_guild" || param.type === "discord_channel") {
+  if (param.type === "discord_guild" || param.type === "discord_channel" || param.type === "model_profile" || param.type === "agent") {
     return null;
   }
   if (param.minLength != null && trim.length < param.minLength) {
@@ -44,15 +45,35 @@ export function ParamForm({
   values,
   onChange,
   onSubmit,
+  submitLabel = "Preview",
   discordGuildChannels = [],
 }: {
   recipe: Recipe;
   values: Record<string, string>;
   onChange: (id: string, value: string) => void;
   onSubmit: () => void;
+  submitLabel?: string;
   discordGuildChannels?: DiscordGuildChannel[];
 }) {
   const [touched, setTouched] = useState<Record<string, boolean>>({});
+  const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
+  const [agents, setAgents] = useState<AgentOverview[]>([]);
+
+  // Lazily load model profiles if any param needs them
+  const needsProfiles = recipe.params.some((p) => p.type === "model_profile");
+  useEffect(() => {
+    if (needsProfiles) {
+      api.listModelProfiles().then(setModelProfiles).catch(() => {});
+    }
+  }, [needsProfiles]);
+
+  // Lazily load agents if any param needs them
+  const needsAgents = recipe.params.some((p) => p.type === "agent");
+  useEffect(() => {
+    if (needsAgents) {
+      api.listAgentsOverview().then(setAgents).catch(() => {});
+    }
+  }, [needsAgents]);
 
   const uniqueGuilds = useMemo(() => {
     const seen = new Map<string, string>();
@@ -138,6 +159,54 @@ export function ParamForm({
       );
     }
 
+    if (param.type === "agent") {
+      return (
+        <Select
+          value={values[param.id] || undefined}
+          onValueChange={(val) => {
+            onChange(param.id, val);
+            setTouched((prev) => ({ ...prev, [param.id]: true }));
+          }}
+        >
+          <SelectTrigger id={param.id} className="w-full">
+            <SelectValue placeholder="Select an agent" />
+          </SelectTrigger>
+          <SelectContent>
+            {agents.map((a) => (
+              <SelectItem key={a.id} value={a.id}>
+                {a.emoji ? `${a.emoji} ` : ""}{a.name || a.id}
+                <span className="text-muted-foreground ml-1.5 text-xs">({a.id})</span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      );
+    }
+
+    if (param.type === "model_profile") {
+      const enabledProfiles = modelProfiles.filter((p) => p.enabled);
+      return (
+        <Select
+          value={values[param.id] || undefined}
+          onValueChange={(val) => {
+            onChange(param.id, val);
+            setTouched((prev) => ({ ...prev, [param.id]: true }));
+          }}
+        >
+          <SelectTrigger id={param.id} className="w-full">
+            <SelectValue placeholder="Select a model" />
+          </SelectTrigger>
+          <SelectContent>
+            {enabledProfiles.map((p) => (
+              <SelectItem key={p.id} value={`${p.provider}/${p.model}`}>
+                {p.provider}/{p.model}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      );
+    }
+
     if (param.type === "textarea") {
       return (
         <Textarea
@@ -189,7 +258,7 @@ export function ParamForm({
         type="submit"
         disabled={hasError}
       >
-        Preview
+        {submitLabel}
       </Button>
     </form>
   );

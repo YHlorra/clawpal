@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentOverview, ApplyResult, BackupInfo, DiscordGuildChannel, HistoryItem, ModelCatalogProvider, ModelProfile, PreviewResult, Recipe, ResolvedApiKey, StatusLight, SystemStatus, DoctorReport, MemoryFile, SessionFile } from "./types";
+import type { AgentOverview, ApplyResult, BackupInfo, ConfigDirtyState, DiscordGuildChannel, HistoryItem, ModelCatalogProvider, ModelProfile, PreviewResult, ProviderAuthSuggestion, Recipe, ResolvedApiKey, StatusLight, SystemStatus, DoctorReport, MemoryFile, SessionFile } from "./types";
 
 export const api = {
   getSystemStatus: (): Promise<SystemStatus> =>
@@ -32,12 +32,20 @@ export const api = {
     invoke("upsert_model_profile", { profile }),
   deleteModelProfile: (profileId: string): Promise<boolean> =>
     invoke("delete_model_profile", { profile_id: profileId }),
+  resolveProviderAuth: (provider: string): Promise<ProviderAuthSuggestion> =>
+    invoke("resolve_provider_auth", { provider }),
   resolveApiKeys: (): Promise<ResolvedApiKey[]> =>
     invoke("resolve_api_keys", {}),
   listAgentIds: (): Promise<string[]> =>
     invoke("list_agent_ids", {}),
   listAgentsOverview: (): Promise<AgentOverview[]> =>
     invoke("list_agents_overview", {}),
+  createAgent: (agentId: string, modelProfileId?: string, independent?: boolean): Promise<AgentOverview> =>
+    invoke("create_agent", { agentId, modelProfileId, independent }),
+  deleteAgent: (agentId: string): Promise<boolean> =>
+    invoke("delete_agent", { agentId }),
+  setupAgentIdentity: (agentId: string, name: string, emoji?: string): Promise<boolean> =>
+    invoke("setup_agent_identity", { agentId, name, emoji }),
   listMemoryFiles: (): Promise<MemoryFile[]> =>
     invoke("list_memory_files", {}),
   deleteMemoryFile: (filePath: string): Promise<boolean> =>
@@ -78,4 +86,18 @@ export const api = {
     invoke("refresh_discord_guild_channels", {}),
   restartGateway: (): Promise<boolean> =>
     invoke("restart_gateway", {}),
+  setGlobalModel: (profileId: string | null): Promise<boolean> =>
+    invoke("set_global_model", { profileId }),
+  listBindings: (): Promise<Record<string, unknown>[]> =>
+    invoke("list_bindings", {}),
+  assignChannelAgent: (channelType: string, peerId: string, agentId: string | null): Promise<boolean> =>
+    invoke("assign_channel_agent", { channelType, peerId, agentId }),
+  saveConfigBaseline: (): Promise<boolean> =>
+    invoke("save_config_baseline", {}),
+  checkConfigDirty: (): Promise<ConfigDirtyState> =>
+    invoke("check_config_dirty", {}),
+  discardConfigChanges: (): Promise<boolean> =>
+    invoke("discard_config_changes", {}),
+  applyPendingChanges: (): Promise<boolean> =>
+    invoke("apply_pending_changes", {}),
 };

@@ -7,14 +7,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import type { DiscordGuildChannel } from "../lib/types";
 
-type ApplyPhase =
-  | { step: "idle" }
-  | { step: "applying" }
-  | { step: "applied"; snapshotId?: string }
-  | { step: "restarting" }
-  | { step: "done" }
-  | { step: "error"; message: string };
-
 export function Cook({
   recipeId,
   onDone,
@@ -28,7 +20,9 @@ export function Cook({
 }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [params, setParams] = useState<Record<string, string>>({});
-  const [phase, setPhase] = useState<ApplyPhase>({ step: "idle" });
+  const [isApplying, setIsApplying] = useState(false);
+  const [applied, setApplied] = useState(false);
+  const [applyError, setApplyError] = useState("");
   const [isPreviewing, setIsPreviewing] = useState(false);
 
   useEffect(() => {
@@ -48,30 +42,54 @@ export function Cook({
 
   if (!recipe) return <div>Recipe not found</div>;
 
+  const isCustomAction = !!recipe.action;
+
   const handleApply = async () => {
-    setPhase({ step: "applying" });
+    setIsApplying(true);
+    setApplyError("");
     try {
       const result = await api.applyRecipe(recipe.id, params, recipeSource);
       if (!result.ok) {
         const errors = result.errors.length ? result.errors.join(", ") : "failed";
-        setPhase({ step: "error", message: `Apply failed: ${errors}` });
+        setApplyError(`Apply failed: ${errors}`);
         return;
       }
-      setPhase({ step: "applied", snapshotId: result.snapshotId });
-
-      setPhase({ step: "restarting" });
-      try {
-        await api.restartGateway();
-      } catch {
-        // Gateway restart failed — config is still applied, just warn
-      }
-      setPhase({ step: "done" });
+      setApplied(true);
     } catch (err) {
-      setPhase({ step: "error", message: String(err) });
+      setApplyError(String(err));
+    } finally {
+      setIsApplying(false);
     }
   };
 
-  const isBusy = phase.step === "applying" || phase.step === "restarting";
+  const handleCustomAction = async () => {
+    setIsApplying(true);
+    setApplyError("");
+    try {
+      if (recipe.action === "setup_agent") {
+        await api.setupAgentIdentity(
+          params.agent_id,
+          params.name,
+          params.emoji || undefined,
+        );
+      } else {
+        throw new Error(`Unknown action: ${recipe.action}`);
+      }
+      setApplied(true);
+    } catch (err) {
+      setApplyError(String(err));
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const successMessage = isCustomAction
+    ? "Done"
+    : "Config updated";
+
+  const successHint = isCustomAction
+    ? "Agent identity has been updated."
+    : "Use \"Apply Changes\" in the sidebar to restart the gateway and activate the changes.";
 
   return (
     <section>
@@ -79,13 +97,13 @@ export function Cook({
         Cook {recipe.name}
       </h2>
 
-      {phase.step === "done" ? (
+      {applied ? (
         <Card>
           <CardContent className="py-8 text-center">
             <div className="text-2xl mb-2">&#10003;</div>
-            <p className="text-lg font-medium">Recipe applied successfully</p>
+            <p className="text-lg font-medium">{successMessage}</p>
             <p className="text-sm text-muted-foreground mt-1">
-              Gateway has been restarted. The changes are now in effect.
+              {successHint}
             </p>
             <Button className="mt-4" onClick={onDone}>
               Back to Recipes
@@ -99,14 +117,25 @@ export function Cook({
             values={params}
             onChange={(id, value) => setParams((prev) => ({ ...prev, [id]: value }))}
             onSubmit={() => {
-              setIsPreviewing(true);
-              api.previewApply(recipe.id, params, recipeSource)
-                .then((preview) => dispatch({ type: "setPreview", preview }))
-                .catch((err) => dispatch({ type: "setMessage", message: String(err) }))
-                .finally(() => setIsPreviewing(false));
+              if (isCustomAction) {
+                handleCustomAction();
+              } else {
+                setIsPreviewing(true);
+                api.previewApply(recipe.id, params, recipeSource)
+                  .then((preview) => dispatch({ type: "setPreview", preview }))
+                  .catch((err) => dispatch({ type: "setMessage", message: String(err) }))
+                  .finally(() => setIsPreviewing(false));
+              }
             }}
+            submitLabel={isCustomAction ? "Apply" : "Preview"}
             discordGuildChannels={discordGuildChannels}
           />
+          {isCustomAction && applyError && (
+            <p className="text-sm text-destructive mt-2">{applyError}</p>
+          )}
+          {isCustomAction && isApplying && (
+            <p className="text-sm text-muted-foreground mt-2">Applying...</p>
+          )}
           {state.lastPreview && (
             <Card className="mt-4">
               <CardHeader>
@@ -120,17 +149,14 @@ export function Cook({
                   newValue={state.lastPreview.configAfter}
                 />
                 <div className="flex items-center gap-3 mt-3">
-                  <Button disabled={isBusy} onClick={handleApply}>
+                  <Button disabled={isApplying} onClick={handleApply}>
                     Apply
                   </Button>
-                  {phase.step === "applying" && (
+                  {isApplying && (
                     <span className="text-sm text-muted-foreground">Applying config...</span>
                   )}
-                  {phase.step === "restarting" && (
-                    <span className="text-sm text-muted-foreground">Restarting gateway...</span>
-                  )}
-                  {phase.step === "error" && (
-                    <span className="text-sm text-destructive">{phase.message}</span>
+                  {applyError && (
+                    <span className="text-sm text-destructive">{applyError}</span>
                   )}
                   {isPreviewing && (
                     <span className="text-sm text-muted-foreground">Previewing...</span>
@@ -139,7 +165,9 @@ export function Cook({
               </CardContent>
             </Card>
           )}
-          <p className="text-sm text-muted-foreground mt-2">{state.message}</p>
+          {!isCustomAction && (
+            <p className="text-sm text-muted-foreground mt-2">{state.message}</p>
+          )}
         </>
       )}
     </section>

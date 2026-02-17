@@ -46,4 +46,32 @@ export const builtinRecipes = [
     impactCategory: "low",
     impactSummary: "Add/modify channel persona",
   },
+  {
+    id: "default-model-switch",
+    name: "Switch default model",
+    description:
+      "Change the global default model used by all agents (unless overridden per-agent)",
+    version: "1.0.0",
+    tags: ["model", "productivity"],
+    difficulty: "easy",
+    params: [
+      {
+        id: "model_name",
+        label: "Model",
+        type: "model_profile",
+        required: true,
+      },
+    ],
+    patchTemplate: `{
+      "agents": {
+        "defaults": {
+          "model": {
+            "primary": "{{model_name}}"
+          }
+        }
+      }
+    }`,
+    impactCategory: "low",
+    impactSummary: "Switch default model",
+  },
 ];

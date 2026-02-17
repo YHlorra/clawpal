@@ -13,6 +13,8 @@ pub struct SnapshotMeta {
     pub config_path: String,
     pub source: String,
     pub can_rollback: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rollback_of: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -48,6 +50,7 @@ pub fn add_snapshot(
     source: &str,
     rollbackable: bool,
     current_config: &str,
+    rollback_of: Option<String>,
 ) -> Result<SnapshotMeta, String> {
     fs::create_dir_all(paths).map_err(|e| e.to_string())?;
 
@@ -66,6 +69,7 @@ pub fn add_snapshot(
         config_path: snapshot_path.to_string_lossy().to_string(),
         source: source.to_string(),
         can_rollback: rollbackable,
+        rollback_of: rollback_of.clone(),
     });
     next.items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     if next.items.len() > 200 {
@@ -82,6 +86,7 @@ pub fn add_snapshot(
         config_path: snapshot_path.to_string_lossy().to_string(),
         source: source.to_string(),
         can_rollback: rollbackable,
+        rollback_of,
     })
 }
 

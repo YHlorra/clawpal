@@ -34,25 +34,38 @@
       "impactSummary": "Add/modify channel persona"
     },
     {
-      "id": "model-switch",
-      "name": "Model switch",
-      "description": "Quickly switch default model",
+      "id": "setup-agent",
+      "name": "Setup agent identity",
+      "description": "Set the display name and emoji for an agent",
       "version": "1.0.0",
-      "tags": ["model", "productivity"],
+      "tags": ["agent", "identity", "beginner"],
       "difficulty": "easy",
+      "action": "setup_agent",
       "params": [
         {
-          "id": "model_name",
-          "label": "Model name",
+          "id": "agent_id",
+          "label": "Agent",
+          "type": "agent",
+          "required": true
+        },
+        {
+          "id": "name",
+          "label": "Display Name",
           "type": "string",
           "required": true,
-          "minLength": 1,
-          "placeholder": "gpt-4o"
+          "placeholder": "e.g. Owlia"
+        },
+        {
+          "id": "emoji",
+          "label": "Emoji",
+          "type": "string",
+          "required": false,
+          "placeholder": "e.g. 🦉"
         }
       ],
-      "patchTemplate": "\n{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"{{model_name}}\"\n    }\n  }\n}",
+      "patchTemplate": "",
       "impactCategory": "low",
-      "impactSummary": "Switch default model"
+      "impactSummary": "Set agent display name and emoji"
     }
   ]
 }

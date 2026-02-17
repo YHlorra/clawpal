@@ -1,89 +1,141 @@
-import { useEffect, useReducer } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { initialState, reducer } from "../lib/state";
 import { DiffViewer } from "../components/DiffViewer";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import type { HistoryItem, PreviewResult } from "../lib/types";
+
+/** Parse "2026-02-17T14-30-00-recipe" style timestamps to local YYYY-MM-DD HH:MM:SS */
+function formatHistoryTime(raw: string): string {
+  // createdAt is like "2026-02-17T14-30-00" (UTC)
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
+  if (!match) return raw;
+  const [, y, mo, d, h, mi, s] = match;
+  const utc = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}Z`);
+  if (isNaN(utc.getTime())) return raw;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${utc.getFullYear()}-${pad(utc.getMonth() + 1)}-${pad(utc.getDate())} ${pad(utc.getHours())}:${pad(utc.getMinutes())}:${pad(utc.getSeconds())}`;
+}
 
 export function History() {
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const [message, setMessage] = useState("");
+
   const refreshHistory = () =>
     api.listHistory(50, 0)
-      .then((resp) => dispatch({ type: "setHistory", history: resp.items }))
-      .catch(() => dispatch({ type: "setMessage", message: "Failed to load history" }));
+      .then((resp) => setHistory(resp.items))
+      .catch(() => setMessage("Failed to load history"));
 
   useEffect(() => {
     refreshHistory();
   }, []);
 
+  // Build a map from snapshot ID to its display info for rollback references
+  const historyMap = new Map(
+    history.map((h) => [h.id, h])
+  );
+
   return (
     <section>
       <h2 className="text-2xl font-bold mb-4">History</h2>
       <div className="space-y-3">
-        {state.history.map((item) => (
-          <Card key={item.id}>
-            <CardContent>
-              <p className="text-sm">
-                {item.createdAt} · {item.recipeId || "manual"} · {item.source}
-                {!item.canRollback && (
-                  <Badge variant="outline" className="ml-2">not rollbackable</Badge>
+        {history.map((item) => {
+          const isRollback = item.source === "rollback";
+          const rollbackTarget = item.rollbackOf ? historyMap.get(item.rollbackOf) : undefined;
+          return (
+            <Card key={item.id} className={isRollback ? "border-dashed opacity-75" : ""}>
+              <CardContent>
+                <div className="flex items-center gap-2 text-sm flex-wrap">
+                  <span className="text-muted-foreground">{formatHistoryTime(item.createdAt)}</span>
+                  {isRollback ? (
+                    <>
+                      <Badge variant="outline">rollback</Badge>
+                      <span className="text-muted-foreground">
+                        Reverted {rollbackTarget
+                          ? `"${rollbackTarget.recipeId || "manual"}" from ${formatHistoryTime(rollbackTarget.createdAt)}`
+                          : item.recipeId || "unknown"
+                        }
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Badge variant="secondary">{item.recipeId || "manual"}</Badge>
+                      <span className="text-muted-foreground">{item.source}</span>
+                    </>
+                  )}
+                  {!item.canRollback && !isRollback && (
+                    <Badge variant="outline" className="text-muted-foreground">not rollbackable</Badge>
+                  )}
+                </div>
+                {!isRollback && (
+                  <div className="flex gap-2 mt-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          const p = await api.previewRollback(item.id);
+                          setPreview(p);
+                        } catch (err) {
+                          setMessage(String(err));
+                        }
+                      }}
+                      disabled={!item.canRollback}
+                    >
+                      Preview
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          await api.rollback(item.id);
+                          setMessage("Rollback completed");
+                          await refreshHistory();
+                        } catch (err) {
+                          setMessage(String(err));
+                        }
+                      }}
+                      disabled={!item.canRollback}
+                    >
+                      Rollback
+                    </Button>
+                  </div>
                 )}
-              </p>
-              <div className="flex gap-2 mt-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={async () => {
-                    try {
-                      const preview = await api.previewRollback(item.id);
-                      dispatch({ type: "setPreview", preview });
-                    } catch (err) {
-                      dispatch({ type: "setMessage", message: String(err) });
-                    }
-                  }}
-                  disabled={!item.canRollback}
-                >
-                  Preview rollback
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={async () => {
-                    if (!item.canRollback) {
-                      dispatch({
-                        type: "setMessage",
-                        message: "This snapshot cannot be rolled back",
-                      });
-                      return;
-                    }
-                    try {
-                      await api.rollback(item.id);
-                      dispatch({ type: "setMessage", message: "Rollback completed" });
-                      await refreshHistory();
-                    } catch (err) {
-                      dispatch({ type: "setMessage", message: String(err) });
-                    }
-                  }}
-                  disabled={!item.canRollback}
-                >
-                  Rollback
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
+              </CardContent>
+            </Card>
+          );
+        })}
       </div>
-      {state.lastPreview && (
-        <DiffViewer
-          oldValue={state.lastPreview.configBefore}
-          newValue={state.lastPreview.configAfter}
-        />
-      )}
       <Button variant="outline" onClick={refreshHistory} className="mt-3">
         Refresh
       </Button>
-      <p className="text-sm text-muted-foreground mt-2">{state.message}</p>
+      {message && (
+        <p className="text-sm text-muted-foreground mt-2">{message}</p>
+      )}
+
+      {/* Preview Dialog */}
+      <Dialog open={!!preview} onOpenChange={(open) => { if (!open) setPreview(null); }}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Rollback Preview</DialogTitle>
+          </DialogHeader>
+          {preview && (
+            <DiffViewer
+              oldValue={preview.configBefore}
+              newValue={preview.configAfter}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

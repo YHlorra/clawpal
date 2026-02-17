@@ -10,7 +10,7 @@ export interface DiscordGuildChannel {
 export interface RecipeParam {
   id: string;
   label: string;
-  type: "string" | "number" | "boolean" | "textarea" | "discord_guild" | "discord_channel";
+  type: "string" | "number" | "boolean" | "textarea" | "discord_guild" | "discord_channel" | "model_profile" | "agent";
   required: boolean;
   pattern?: string;
   minLength?: number;
@@ -26,6 +26,7 @@ export interface Recipe {
   tags: string[];
   difficulty: "easy" | "normal" | "advanced";
   params: RecipeParam[];
+  action?: string;
   patchTemplate: string;
   impactCategory: string;
   impactSummary: string;
@@ -136,6 +137,12 @@ export interface ModelCatalogProvider {
   models: ModelCatalogModel[];
 }
 
+export interface ProviderAuthSuggestion {
+  authRef: string | null;
+  hasKey: boolean;
+  source: string;
+}
+
 export interface ResolvedApiKey {
   profileId: string;
   maskedKey: string;
@@ -147,6 +154,7 @@ export interface HistoryItem {
   createdAt: string;
   source: string;
   canRollback: boolean;
+  rollbackOf?: string;
 }
 
 export interface DoctorIssue {
@@ -171,12 +179,19 @@ export interface AgentOverview {
   model: string | null;
   channels: string[];
   online: boolean;
+  workspace?: string;
 }
 
 export interface StatusLight {
   healthy: boolean;
   activeAgents: number;
   globalDefaultModel?: string;
+}
+
+export interface ConfigDirtyState {
+  dirty: boolean;
+  baseline: string;
+  current: string;
 }
 
 export interface BackupInfo {

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
-import type { ModelCatalogProvider, ModelProfile, ResolvedApiKey } from "@/lib/types";
+import type { BackupInfo, ModelCatalogProvider, ModelProfile, ProviderAuthSuggestion, ResolvedApiKey } from "@/lib/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -113,12 +113,27 @@ function AutocompleteField({
   );
 }
 
-export function Settings() {
+function formatBytes(bytes: number) {
+  if (bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let index = 0;
+  let value = bytes;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(1)} ${units[index]}`;
+}
+
+export function Settings({ onDataChange }: { onDataChange?: () => void }) {
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [catalog, setCatalog] = useState<ModelCatalogProvider[]>([]);
   const [apiKeys, setApiKeys] = useState<ResolvedApiKey[]>([]);
   const [form, setForm] = useState<ProfileForm>(emptyForm());
   const [message, setMessage] = useState("");
+  const [authSuggestion, setAuthSuggestion] = useState<ProviderAuthSuggestion | null>(null);
+  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [backupMessage, setBackupMessage] = useState("");
 
   const [catalogRefreshed, setCatalogRefreshed] = useState(false);
 
@@ -135,6 +150,11 @@ export function Settings() {
     api.getCachedModelCatalog().then(setCatalog).catch(() => {});
   }, []);
 
+  // Load backups
+  useEffect(() => {
+    api.listBackups().then(setBackups).catch(() => {});
+  }, []);
+
   // Refresh catalog from CLI when user focuses provider/model input
   const ensureCatalog = () => {
     if (catalogRefreshed) return;
@@ -143,6 +163,17 @@ export function Settings() {
       if (fresh.length > 0) setCatalog(fresh);
     }).catch(() => {});
   };
+
+  // Check for existing auth when provider changes (only for new profiles)
+  useEffect(() => {
+    if (form.id || !form.provider.trim()) {
+      setAuthSuggestion(null);
+      return;
+    }
+    api.resolveProviderAuth(form.provider)
+      .then(setAuthSuggestion)
+      .catch(() => setAuthSuggestion(null));
+  }, [form.provider, form.id]);
 
   const maskedKeyMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -163,7 +194,7 @@ export function Settings() {
       setMessage("Provider and Model are required");
       return;
     }
-    if (!form.apiKey && !form.id) {
+    if (!form.apiKey && !form.id && !authSuggestion?.hasKey) {
       setMessage("API Key is required");
       return;
     }
@@ -172,7 +203,7 @@ export function Settings() {
       name: `${form.provider}/${form.model}`,
       provider: form.provider,
       model: form.model,
-      authRef: "",
+      authRef: (!form.apiKey && authSuggestion?.authRef) ? authSuggestion.authRef : "",
       apiKey: form.apiKey || undefined,
       baseUrl: form.useCustomUrl && form.baseUrl ? form.baseUrl : undefined,
       enabled: form.enabled,
@@ -183,6 +214,7 @@ export function Settings() {
         setMessage("Profile saved");
         setForm(emptyForm());
         refreshProfiles();
+        onDataChange?.();
       })
       .catch(() => setMessage("Save failed"));
   };
@@ -208,6 +240,7 @@ export function Settings() {
           setForm(emptyForm());
         }
         refreshProfiles();
+        onDataChange?.();
       })
       .catch(() => setMessage("Delete failed"));
   };
@@ -215,6 +248,14 @@ export function Settings() {
   return (
     <section>
       <h2 className="text-2xl font-bold mb-4">Settings</h2>
+
+      <p className="text-sm text-muted-foreground mb-4">
+        For OAuth-based providers (GitHub Copilot, etc.), use the CLI:
+        <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login</code>
+        or
+        <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login-github-copilot</code>.
+        Profiles created via CLI will appear in the list on the right.
+      </p>
 
       {/* ---- Model Profiles ---- */}
       <div className="grid grid-cols-2 gap-3 items-start">
@@ -261,12 +302,17 @@ export function Settings() {
                 <Label>API Key</Label>
                 <Input
                   type="password"
-                  placeholder={form.id ? "(unchanged if empty)" : "sk-..."}
+                  placeholder={form.id ? "(unchanged if empty)" : authSuggestion?.hasKey ? "(optional — key already available)" : "sk-..."}
                   value={form.apiKey}
                   onChange={(e) =>
                     setForm((p) => ({ ...p, apiKey: e.target.value }))
                   }
                 />
+                {!form.id && authSuggestion?.hasKey && (
+                  <p className="text-xs text-muted-foreground">
+                    Key available via {authSuggestion.source}. Leave empty to reuse it.
+                  </p>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -413,6 +459,97 @@ export function Settings() {
 
       {message && (
         <p className="text-sm text-muted-foreground mt-3">{message}</p>
+      )}
+
+      {/* Backups */}
+      <h3 className="text-lg font-semibold mt-6 mb-3">Backups</h3>
+      {backups.length === 0 ? (
+        <p className="text-muted-foreground text-sm">No backups available.</p>
+      ) : (
+        <div className="space-y-2">
+          {backups.map((backup) => (
+            <Card key={backup.name}>
+              <CardContent className="flex items-center justify-between">
+                <div>
+                  <div className="font-medium text-sm">{backup.name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {backup.createdAt} — {formatBytes(backup.sizeBytes)}
+                  </div>
+                </div>
+                <div className="flex gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => api.openUrl(backup.path)}
+                  >
+                    Show
+                  </Button>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button size="sm" variant="outline">
+                        Restore
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Restore from backup?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This will restore config and workspace files from backup "{backup.name}". Current files will be overwritten.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                          onClick={() => {
+                            api.restoreFromBackup(backup.name)
+                              .then((msg) => setBackupMessage(msg))
+                              .catch(() => setBackupMessage("Restore failed"));
+                          }}
+                        >
+                          Restore
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button size="sm" variant="destructive">
+                        Delete
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Delete backup?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This will permanently delete backup "{backup.name}". This action cannot be undone.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                          className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                          onClick={() => {
+                            api.deleteBackup(backup.name)
+                              .then(() => {
+                                setBackupMessage(`Deleted backup "${backup.name}"`);
+                                api.listBackups().then(setBackups).catch(() => {});
+                              })
+                              .catch(() => setBackupMessage("Delete failed"));
+                          }}
+                        >
+                          Delete
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+      {backupMessage && (
+        <p className="text-sm text-muted-foreground mt-2">{backupMessage}</p>
       )}
     </section>
   );

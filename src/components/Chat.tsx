@@ -87,9 +87,8 @@ export function Chat() {
   }, [input, loading, agentId, sessionId]);
 
   return (
-    <div className="w-[340px] min-w-[300px] flex flex-col border-l border-border pl-4">
+    <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 mb-2">
-        <h3 className="text-lg font-semibold m-0">Chat</h3>
         <Select value={agentId} onValueChange={(a) => { setAgentId(a); setSessionId(loadSessionId(a)); setMessages([]); }}>
           <SelectTrigger className="w-auto h-7 text-xs">
             <SelectValue />

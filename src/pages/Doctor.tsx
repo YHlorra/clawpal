@@ -41,6 +41,7 @@ export function Doctor() {
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [dataMessage, setDataMessage] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [lastRefreshed, setLastRefreshed] = useState<string | null>(null);
 
   const hasReport = Boolean(state.doctor);
   const autoFixable = hasReport
@@ -176,9 +177,11 @@ export function Doctor() {
                 setRefreshing(true);
                 api
                   .runDoctor()
-                  .then((report) =>
-                    dispatch({ type: "setDoctor", doctor: report }),
-                  )
+                  .then((report) => {
+                    dispatch({ type: "setDoctor", doctor: report });
+                    setLastRefreshed(new Date().toLocaleTimeString());
+                    refreshData();
+                  })
                   .catch(() =>
                     dispatch({
                       type: "setMessage",
@@ -190,6 +193,11 @@ export function Doctor() {
             >
               {refreshing ? "Refreshing..." : "Refresh"}
             </Button>
+            {lastRefreshed && (
+              <span className="text-xs text-muted-foreground ml-2">
+                Last refreshed: {lastRefreshed}
+              </span>
+            )}
           </div>
         </div>
       )}
