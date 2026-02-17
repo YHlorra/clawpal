@@ -35,14 +35,19 @@ function renderArgs(
 
 const registry: Record<string, ActionDef> = {
   create_agent: {
-    execute: (args) =>
-      api.createAgent(
+    execute: (args) => {
+      const model = args.modelProfileId as string | undefined;
+      return api.createAgent(
         args.agentId as string,
-        args.modelProfileId as string | undefined,
+        model === "__default__" ? undefined : model,
         args.independent as boolean | undefined,
-      ),
-    describe: (args) =>
-      `Create ${args.independent ? "independent " : ""}agent "${args.agentId}"`,
+      );
+    },
+    describe: (args) => {
+      const model = args.modelProfileId as string | undefined;
+      const modelLabel = !model || model === "__default__" ? "default model" : model;
+      return `Create ${args.independent ? "independent " : ""}agent "${args.agentId}" (${modelLabel})`;
+    },
   },
   setup_identity: {
     execute: (args) =>

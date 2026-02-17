@@ -36,7 +36,7 @@ export function Cook({
       if (found) {
         const defaults: Record<string, string> = {};
         for (const p of found.params) {
-          defaults[p.id] = "";
+          defaults[p.id] = p.defaultValue ?? "";
         }
         setParams(defaults);
       }

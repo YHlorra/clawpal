@@ -219,6 +219,9 @@ export function ParamForm({
             <SelectValue placeholder="Select a model" />
           </SelectTrigger>
           <SelectContent>
+            <SelectItem value="__default__">
+              <span className="text-muted-foreground">Use global default</span>
+            </SelectItem>
             {enabledProfiles.map((p) => (
               <SelectItem key={p.id} value={`${p.provider}/${p.model}`}>
                 {p.provider}/{p.model}

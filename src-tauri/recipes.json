@@ -9,6 +9,7 @@
       "difficulty": "easy",
       "params": [
         { "id": "agent_id", "label": "Agent ID", "type": "string", "required": true, "placeholder": "e.g. my-bot" },
+        { "id": "model", "label": "Model", "type": "model_profile", "required": true, "defaultValue": "__default__" },
         { "id": "guild_id", "label": "Guild", "type": "discord_guild", "required": true },
         { "id": "channel_id", "label": "Channel", "type": "discord_channel", "required": true },
         { "id": "independent", "label": "Create independent agent", "type": "boolean", "required": false },
@@ -17,7 +18,7 @@
         { "id": "persona", "label": "Persona", "type": "textarea", "required": false, "placeholder": "You are...", "dependsOn": "independent" }
       ],
       "steps": [
-        { "action": "create_agent", "label": "Create agent", "args": { "agentId": "{{agent_id}}", "independent": "{{independent}}" } },
+        { "action": "create_agent", "label": "Create agent", "args": { "agentId": "{{agent_id}}", "modelProfileId": "{{model}}", "independent": "{{independent}}" } },
         { "action": "setup_identity", "label": "Set agent identity", "args": { "agentId": "{{agent_id}}", "name": "{{name}}", "emoji": "{{emoji}}" } },
         { "action": "bind_channel", "label": "Bind channel to agent", "args": { "channelType": "discord", "peerId": "{{channel_id}}", "agentId": "{{agent_id}}" } },
         { "action": "config_patch", "label": "Set channel persona", "args": { "patchTemplate": "{\"channels\":{\"discord\":{\"guilds\":{\"{{guild_id}}\":{\"channels\":{\"{{channel_id}}\":{\"systemPrompt\":\"{{persona}}\"}}}}}}}" } }
