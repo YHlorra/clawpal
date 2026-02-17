@@ -1013,11 +1013,16 @@ pub fn delete_agent(agent_id: String) -> Result<bool, String> {
         return Err(format!("Agent '{}' not found", agent_id));
     }
 
-    // Also remove any bindings that reference this agent
+    // Reset any bindings that reference this agent back to "main" (default)
+    // so the channel doesn't lose its binding entry entirely.
     if let Some(bindings) = cfg.pointer_mut("/bindings").and_then(Value::as_array_mut) {
-        bindings.retain(|b| {
-            b.get("agentId").and_then(Value::as_str) != Some(&agent_id)
-        });
+        for b in bindings.iter_mut() {
+            if b.get("agentId").and_then(Value::as_str) == Some(&agent_id) {
+                if let Some(obj) = b.as_object_mut() {
+                    obj.insert("agentId".into(), Value::String("main".into()));
+                }
+            }
+        }
     }
 
     write_config_with_snapshot(&paths, &current, &cfg, "delete-agent")?;
@@ -1402,26 +1407,77 @@ fn run_external_command_raw(parts: &[&str]) -> Result<OpenclawCommandOutput, Str
 }
 
 fn run_openclaw_raw(args: &[&str]) -> Result<OpenclawCommandOutput, String> {
-    let mut command = Command::new("openclaw");
-    command.args(args);
-    let output = command
-        .output()
+    run_openclaw_raw_timeout(args, None)
+}
+
+fn run_openclaw_raw_timeout(args: &[&str], timeout_secs: Option<u64>) -> Result<OpenclawCommandOutput, String> {
+    let mut child = Command::new("openclaw")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| format!("failed to run openclaw: {error}"))?;
-    let exit_code = output.status.code().unwrap_or(-1);
-    let result = OpenclawCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
-        exit_code,
-    };
-    if exit_code != 0 {
-        let details = if !result.stderr.is_empty() {
-            result.stderr.clone()
-        } else {
-            result.stdout.clone()
+
+    if let Some(secs) = timeout_secs {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(status) => {
+                    let mut stdout_buf = Vec::new();
+                    let mut stderr_buf = Vec::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        std::io::Read::read_to_end(&mut out, &mut stdout_buf).ok();
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        std::io::Read::read_to_end(&mut err, &mut stderr_buf).ok();
+                    }
+                    let exit_code = status.code().unwrap_or(-1);
+                    let result = OpenclawCommandOutput {
+                        stdout: String::from_utf8_lossy(&stdout_buf).trim_end().to_string(),
+                        stderr: String::from_utf8_lossy(&stderr_buf).trim_end().to_string(),
+                        exit_code,
+                    };
+                    if exit_code != 0 {
+                        let details = if !result.stderr.is_empty() {
+                            result.stderr.clone()
+                        } else {
+                            result.stdout.clone()
+                        };
+                        return Err(format!("openclaw command failed ({exit_code}): {details}"));
+                    }
+                    return Ok(result);
+                }
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(format!(
+                            "Command timed out after {secs}s. The gateway may still be restarting in the background."
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    } else {
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("failed to run openclaw: {error}"))?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        let result = OpenclawCommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
+            exit_code,
         };
-        return Err(format!("openclaw command failed ({exit_code}): {details}"));
+        if exit_code != 0 {
+            let details = if !result.stderr.is_empty() {
+                result.stderr.clone()
+            } else {
+                result.stdout.clone()
+            };
+            return Err(format!("openclaw command failed ({exit_code}): {details}"));
+        }
+        Ok(result)
     }
-    Ok(result)
 }
 
 /// Strip leading non-JSON lines from CLI output (plugin logs, ANSI codes, etc.)
@@ -3209,8 +3265,8 @@ pub async fn apply_pending_changes() -> Result<bool, String> {
         fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
         fs::write(&bp, &text).map_err(|e| e.to_string())?;
 
-        // Restart gateway
-        run_openclaw_raw(&["gateway", "restart"])?;
+        // Restart gateway (30s timeout to prevent indefinite hang)
+        run_openclaw_raw_timeout(&["gateway", "restart"], Some(30))?;
         Ok(true)
     }).await.map_err(|e| e.to_string())?
 }

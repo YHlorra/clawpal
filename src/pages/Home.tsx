@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -76,10 +76,30 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
   const [creatingAgent, setCreatingAgent] = useState(false);
   const [createAgentError, setCreateAgentError] = useState("");
 
-  // Fast calls: render immediately
-  useEffect(() => {
-    api.getStatusLight().then(setStatus).catch(() => {});
+  // Health status with grace period: retry quickly when unhealthy, then slow-poll
+  const [statusSettled, setStatusSettled] = useState(false);
+  const retriesRef = useRef(0);
+
+  const fetchStatus = useCallback(() => {
+    api.getStatusLight().then((s) => {
+      setStatus(s);
+      if (s.healthy) {
+        setStatusSettled(true);
+        retriesRef.current = 0;
+      } else if (retriesRef.current < 5) {
+        retriesRef.current++;
+      } else {
+        setStatusSettled(true);
+      }
+    }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    // Poll fast (2s) while not settled, slow (10s) once settled
+    const interval = setInterval(fetchStatus, statusSettled ? 10000 : 2000);
+    return () => clearInterval(interval);
+  }, [fetchStatus, statusSettled]);
 
   const refreshAgents = () => {
     api.listAgentsOverview().then(setAgents).catch(() => {});
@@ -166,13 +186,13 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
           <CardContent className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-3 items-center">
             <span className="text-sm text-muted-foreground">Health</span>
             <span className="text-sm font-medium">
-              {status ? (
-                status.healthy ? (
-                  <Badge className="bg-green-100 text-green-700 border-0">Healthy</Badge>
-                ) : (
-                  <Badge className="bg-red-100 text-red-700 border-0">Unhealthy</Badge>
-                )
-              ) : "..."}
+              {!status ? "..." : status.healthy ? (
+                <Badge className="bg-green-100 text-green-700 border-0">Healthy</Badge>
+              ) : !statusSettled ? (
+                <Badge className="bg-amber-100 text-amber-700 border-0">Checking...</Badge>
+              ) : (
+                <Badge className="bg-red-100 text-red-700 border-0">Unhealthy</Badge>
+              )}
             </span>
 
             <span className="text-sm text-muted-foreground">Version</span>
