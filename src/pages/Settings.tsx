@@ -79,6 +79,7 @@ function ComboboxField({
     >
       <PopoverTrigger asChild>
         <Button
+          type="button"
           variant="outline"
           role="combobox"
           aria-expanded={open}
