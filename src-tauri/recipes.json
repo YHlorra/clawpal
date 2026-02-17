@@ -1,71 +1,42 @@
 {
   "recipes": [
     {
+      "id": "dedicated-channel-agent",
+      "name": "Create dedicated Agent for Channel",
+      "description": "Create an independent agent, set its identity, bind it to a Discord channel, and configure persona",
+      "version": "1.0.0",
+      "tags": ["discord", "agent", "persona"],
+      "difficulty": "easy",
+      "params": [
+        { "id": "agent_id", "label": "Agent ID", "type": "string", "required": true, "placeholder": "e.g. my-bot" },
+        { "id": "guild_id", "label": "Guild", "type": "discord_guild", "required": true },
+        { "id": "channel_id", "label": "Channel", "type": "discord_channel", "required": true },
+        { "id": "name", "label": "Display Name", "type": "string", "required": true, "placeholder": "e.g. MyBot" },
+        { "id": "emoji", "label": "Emoji", "type": "string", "required": false, "placeholder": "e.g. \ud83e\udd16" },
+        { "id": "persona", "label": "Persona", "type": "textarea", "required": true, "placeholder": "You are..." }
+      ],
+      "steps": [
+        { "action": "create_agent", "label": "Create independent agent", "args": { "agentId": "{{agent_id}}", "independent": true } },
+        { "action": "setup_identity", "label": "Set agent identity", "args": { "agentId": "{{agent_id}}", "name": "{{name}}", "emoji": "{{emoji}}" } },
+        { "action": "bind_channel", "label": "Bind channel to agent", "args": { "channelType": "discord", "peerId": "{{channel_id}}", "agentId": "{{agent_id}}" } },
+        { "action": "config_patch", "label": "Set channel persona", "args": { "patchTemplate": "{\"channels\":{\"discord\":{\"guilds\":{\"{{guild_id}}\":{\"channels\":{\"{{channel_id}}\":{\"systemPrompt\":\"{{persona}}\"}}}}}}}" } }
+      ]
+    },
+    {
       "id": "discord-channel-persona",
-      "name": "Discord channel persona",
-      "description": "Inject different system prompt for one Discord channel",
+      "name": "Channel Persona",
+      "description": "Set a custom persona for a Discord channel",
       "version": "1.0.0",
       "tags": ["discord", "persona", "beginner"],
       "difficulty": "easy",
       "params": [
-        {
-          "id": "guild_id",
-          "label": "Guild",
-          "type": "discord_guild",
-          "required": true
-        },
-        {
-          "id": "channel_id",
-          "label": "Channel",
-          "type": "discord_channel",
-          "required": true
-        },
-        {
-          "id": "persona",
-          "label": "Persona",
-          "type": "textarea",
-          "required": true,
-          "minLength": 1,
-          "placeholder": "You are..."
-        }
+        { "id": "guild_id", "label": "Guild", "type": "discord_guild", "required": true },
+        { "id": "channel_id", "label": "Channel", "type": "discord_channel", "required": true },
+        { "id": "persona", "label": "Persona", "type": "textarea", "required": true, "placeholder": "You are..." }
       ],
-      "patchTemplate": "\n{\n  \"channels\": {\n    \"discord\": {\n      \"guilds\": {\n        \"{{guild_id}}\": {\n          \"channels\": {\n            \"{{channel_id}}\": {\n              \"systemPrompt\": \"{{persona}}\"\n            }\n          }\n        }\n      }\n    }\n  }\n}",
-      "impactCategory": "low",
-      "impactSummary": "Add/modify channel persona"
-    },
-    {
-      "id": "setup-agent",
-      "name": "Setup agent identity",
-      "description": "Set the display name and emoji for an agent",
-      "version": "1.0.0",
-      "tags": ["agent", "identity", "beginner"],
-      "difficulty": "easy",
-      "action": "setup_agent",
-      "params": [
-        {
-          "id": "agent_id",
-          "label": "Agent",
-          "type": "agent",
-          "required": true
-        },
-        {
-          "id": "name",
-          "label": "Display Name",
-          "type": "string",
-          "required": true,
-          "placeholder": "e.g. Owlia"
-        },
-        {
-          "id": "emoji",
-          "label": "Emoji",
-          "type": "string",
-          "required": false,
-          "placeholder": "e.g. 🦉"
-        }
-      ],
-      "patchTemplate": "",
-      "impactCategory": "low",
-      "impactSummary": "Set agent display name and emoji"
+      "steps": [
+        { "action": "config_patch", "label": "Set channel persona", "args": { "patchTemplate": "{\"channels\":{\"discord\":{\"guilds\":{\"{{guild_id}}\":{\"channels\":{\"{{channel_id}}\":{\"systemPrompt\":\"{{persona}}\"}}}}}}}" } }
+      ]
     }
   ]
 }

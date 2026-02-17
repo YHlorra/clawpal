@@ -32,6 +32,14 @@ pub struct RecipeParam {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct RecipeStep {
+    pub action: String,
+    pub label: String,
+    pub args: Map<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Recipe {
     pub id: String,
     pub name: String,
@@ -40,9 +48,7 @@ pub struct Recipe {
     pub tags: Vec<String>,
     pub difficulty: String,
     pub params: Vec<RecipeParam>,
-    pub patch_template: String,
-    pub impact_category: String,
-    pub impact_summary: String,
+    pub steps: Vec<RecipeStep>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -218,22 +224,16 @@ fn render_patch_template(template: &str, params: &Map<String, Value>) -> String 
     text
 }
 
-pub fn build_candidate_config(
+pub fn build_candidate_config_from_template(
     current: &Value,
-    recipe: &Recipe,
+    template: &str,
     params: &Map<String, Value>,
 ) -> Result<(Value, Vec<ChangeItem>), String> {
-    let rendered = render_patch_template(&recipe.patch_template, params);
+    let rendered = render_patch_template(template, params);
     let patch: Value = json5::from_str(&rendered).map_err(|e| e.to_string())?;
-
     let mut merged = current.clone();
     let mut changes = Vec::new();
     apply_merge_patch(&mut merged, &patch, "", &mut changes);
-    if recipe.impact_category == "high" {
-        for change in &mut changes {
-            change.risk = "high".into();
-        }
-    }
     Ok((merged, changes))
 }
 

@@ -11,12 +11,10 @@ use crate::models::resolve_paths;
 use crate::recipe::{
     load_recipes_with_fallback,
     collect_change_paths,
-    build_candidate_config,
-    find_recipe_with_source,
+    build_candidate_config_from_template,
     format_diff,
     ApplyResult,
     PreviewResult,
-    validate,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1195,55 +1193,10 @@ pub fn list_recipes(source: Option<String>) -> Result<Vec<crate::recipe::Recipe>
 }
 
 #[tauri::command]
-pub fn preview_apply(
-    recipe_id: String,
+pub fn apply_config_patch(
+    patch_template: String,
     params: Map<String, Value>,
-    source: Option<String>,
-) -> Result<PreviewResult, String> {
-    let recipe =
-        find_recipe_with_source(&recipe_id, source).ok_or_else(|| "unknown recipe".to_string())?;
-    let errors = validate(&recipe, &params);
-    if !errors.is_empty() {
-        return Err(format!("validation failed: {}", errors.join(",")));
-    }
-    let paths = resolve_paths();
-    ensure_dirs(&paths)?;
-    let current = read_openclaw_config(&paths)?;
-    let (candidate, changes) = build_candidate_config(&current, &recipe, &params)?;
-    let before_text = serde_json::to_string_pretty(&current).unwrap_or_else(|_| "{}".into());
-    let after_text = serde_json::to_string_pretty(&candidate).unwrap_or_else(|_| "{}".into());
-    Ok(PreviewResult {
-        recipe_id: recipe_id.clone(),
-        diff: format_diff(&current, &candidate),
-        config_before: before_text,
-        config_after: after_text,
-        changes,
-        overwrites_existing: true,
-        can_rollback: true,
-        impact_level: recipe.impact_category,
-        warnings: Vec::new(),
-    })
-}
-
-#[tauri::command]
-pub fn apply_recipe(
-    recipe_id: String,
-    params: Map<String, Value>,
-    source: Option<String>,
 ) -> Result<ApplyResult, String> {
-    let recipe =
-        find_recipe_with_source(&recipe_id, source).ok_or_else(|| "unknown recipe".to_string())?;
-    let errors = validate(&recipe, &params);
-    if !errors.is_empty() {
-        return Ok(ApplyResult {
-            ok: false,
-            snapshot_id: None,
-            config_path: String::new(),
-            backup_path: None,
-            warnings: errors,
-            errors: vec!["validation failed".into()],
-        });
-    }
     let paths = resolve_paths();
     ensure_dirs(&paths)?;
     let current = read_openclaw_config(&paths)?;
@@ -1251,13 +1204,13 @@ pub fn apply_recipe(
     let snapshot = add_snapshot(
         &paths.history_dir,
         &paths.metadata_path,
-        Some(recipe_id.clone()),
+        Some("config-patch".into()),
         "apply",
         true,
         &current_text,
         None,
     )?;
-    let (candidate, _changes) = build_candidate_config(&current, &recipe, &params)?;
+    let (candidate, _changes) = build_candidate_config_from_template(&current, &patch_template, &params)?;
     write_json(&paths.config_path, &candidate)?;
     Ok(ApplyResult {
         ok: true,

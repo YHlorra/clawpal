@@ -1,5 +1,5 @@
 use crate::commands::{
-    apply_recipe, fix_issues, get_system_status, get_status_light, list_history, list_recipes, preview_apply,
+    apply_config_patch, fix_issues, get_system_status, get_status_light, list_history, list_recipes,
     list_model_profiles, upsert_model_profile, delete_model_profile,
     list_model_catalog, get_cached_model_catalog, refresh_model_catalog, resolve_provider_auth,
     check_openclaw_update, extract_model_profiles_from_config,
@@ -51,8 +51,7 @@ pub fn run() {
             clear_agent_sessions,
             check_openclaw_update,
             extract_model_profiles_from_config,
-            preview_apply,
-            apply_recipe,
+            apply_config_patch,
             list_history,
             preview_rollback,
             rollback,
