@@ -26,7 +26,7 @@ export function Recipes({
         setLoadedSource(value || undefined);
         setRecipes(r);
       })
-      .catch(() => {})
+      .catch((e) => console.error("Failed to load recipes:", e))
       .finally(() => setIsLoading(false));
   };
 

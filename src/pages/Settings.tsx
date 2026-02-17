@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
-import type { BackupInfo, ModelCatalogProvider, ModelProfile, ProviderAuthSuggestion, ResolvedApiKey } from "@/lib/types";
+import type { ModelCatalogProvider, ModelProfile, ProviderAuthSuggestion, ResolvedApiKey } from "@/lib/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -113,18 +113,6 @@ function AutocompleteField({
   );
 }
 
-function formatBytes(bytes: number) {
-  if (bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let index = 0;
-  let value = bytes;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  return `${value.toFixed(1)} ${units[index]}`;
-}
-
 export function Settings({ onDataChange }: { onDataChange?: () => void }) {
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [catalog, setCatalog] = useState<ModelCatalogProvider[]>([]);
@@ -132,27 +120,20 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
   const [form, setForm] = useState<ProfileForm>(emptyForm());
   const [message, setMessage] = useState("");
   const [authSuggestion, setAuthSuggestion] = useState<ProviderAuthSuggestion | null>(null);
-  const [backups, setBackups] = useState<BackupInfo[]>([]);
-  const [backupMessage, setBackupMessage] = useState("");
 
   const [catalogRefreshed, setCatalogRefreshed] = useState(false);
 
   // Load profiles and API keys immediately (fast)
   const refreshProfiles = () => {
-    api.listModelProfiles().then(setProfiles).catch(() => {});
-    api.resolveApiKeys().then(setApiKeys).catch(() => {});
+    api.listModelProfiles().then(setProfiles).catch((e) => console.error("Failed to load profiles:", e));
+    api.resolveApiKeys().then(setApiKeys).catch((e) => console.error("Failed to resolve API keys:", e));
   };
 
   useEffect(refreshProfiles, []);
 
   // Load catalog from cache instantly (no CLI calls)
   useEffect(() => {
-    api.getCachedModelCatalog().then(setCatalog).catch(() => {});
-  }, []);
-
-  // Load backups
-  useEffect(() => {
-    api.listBackups().then(setBackups).catch(() => {});
+    api.getCachedModelCatalog().then(setCatalog).catch((e) => console.error("Failed to load model catalog:", e));
   }, []);
 
   // Refresh catalog from CLI when user focuses provider/model input
@@ -161,7 +142,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
     setCatalogRefreshed(true);
     api.refreshModelCatalog().then((fresh) => {
       if (fresh.length > 0) setCatalog(fresh);
-    }).catch(() => {});
+    }).catch((e) => console.error("Failed to refresh model catalog:", e));
   };
 
   // Check for existing auth when provider changes (only for new profiles)
@@ -172,7 +153,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
     }
     api.resolveProviderAuth(form.provider)
       .then(setAuthSuggestion)
-      .catch(() => setAuthSuggestion(null));
+      .catch((e) => { console.error("Failed to resolve provider auth:", e); setAuthSuggestion(null); });
   }, [form.provider, form.id]);
 
   const maskedKeyMap = useMemo(() => {
@@ -216,7 +197,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
         refreshProfiles();
         onDataChange?.();
       })
-      .catch(() => setMessage("Save failed"));
+      .catch((e) => setMessage(`Save failed: ${e}`));
   };
 
   const editProfile = (profile: ModelProfile) => {
@@ -242,7 +223,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
         refreshProfiles();
         onDataChange?.();
       })
-      .catch(() => setMessage("Delete failed"));
+      .catch((e) => setMessage(`Delete failed: ${e}`));
   };
 
   return (
@@ -459,97 +440,6 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
 
       {message && (
         <p className="text-sm text-muted-foreground mt-3">{message}</p>
-      )}
-
-      {/* Backups */}
-      <h3 className="text-lg font-semibold mt-6 mb-3">Backups</h3>
-      {backups.length === 0 ? (
-        <p className="text-muted-foreground text-sm">No backups available.</p>
-      ) : (
-        <div className="space-y-2">
-          {backups.map((backup) => (
-            <Card key={backup.name}>
-              <CardContent className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium text-sm">{backup.name}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {backup.createdAt} — {formatBytes(backup.sizeBytes)}
-                  </div>
-                </div>
-                <div className="flex gap-1.5">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => api.openUrl(backup.path)}
-                  >
-                    Show
-                  </Button>
-                  <AlertDialog>
-                    <AlertDialogTrigger asChild>
-                      <Button size="sm" variant="outline">
-                        Restore
-                      </Button>
-                    </AlertDialogTrigger>
-                    <AlertDialogContent>
-                      <AlertDialogHeader>
-                        <AlertDialogTitle>Restore from backup?</AlertDialogTitle>
-                        <AlertDialogDescription>
-                          This will restore config and workspace files from backup "{backup.name}". Current files will be overwritten.
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter>
-                        <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction
-                          onClick={() => {
-                            api.restoreFromBackup(backup.name)
-                              .then((msg) => setBackupMessage(msg))
-                              .catch(() => setBackupMessage("Restore failed"));
-                          }}
-                        >
-                          Restore
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
-                  <AlertDialog>
-                    <AlertDialogTrigger asChild>
-                      <Button size="sm" variant="destructive">
-                        Delete
-                      </Button>
-                    </AlertDialogTrigger>
-                    <AlertDialogContent>
-                      <AlertDialogHeader>
-                        <AlertDialogTitle>Delete backup?</AlertDialogTitle>
-                        <AlertDialogDescription>
-                          This will permanently delete backup "{backup.name}". This action cannot be undone.
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter>
-                        <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction
-                          className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                          onClick={() => {
-                            api.deleteBackup(backup.name)
-                              .then(() => {
-                                setBackupMessage(`Deleted backup "${backup.name}"`);
-                                api.listBackups().then(setBackups).catch(() => {});
-                              })
-                              .catch(() => setBackupMessage("Delete failed"));
-                          }}
-                        >
-                          Delete
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      )}
-      {backupMessage && (
-        <p className="text-sm text-muted-foreground mt-2">{backupMessage}</p>
       )}
     </section>
   );

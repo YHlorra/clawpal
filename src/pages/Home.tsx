@@ -3,9 +3,6 @@ import { api } from "../lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -13,13 +10,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -31,7 +21,11 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import type { StatusLight, AgentOverview, Recipe, HistoryItem, ModelProfile } from "../lib/types";
+import { CreateAgentDialog } from "@/components/CreateAgentDialog";
+import { RecipeCard } from "@/components/RecipeCard";
+import { Skeleton } from "@/components/ui/skeleton";
+import type { StatusLight, AgentOverview, Recipe, BackupInfo, ModelProfile } from "../lib/types";
+import { formatTime, formatBytes } from "@/lib/utils";
 
 interface AgentGroup {
   identity: string;
@@ -56,13 +50,19 @@ function groupAgents(agents: AgentOverview[]): AgentGroup[] {
   return Array.from(map.values());
 }
 
-export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) => void }) {
+export function Home({
+  onCook,
+  showToast,
+}: {
+  onCook?: (recipeId: string, source?: string) => void;
+  showToast?: (message: string, type?: "success" | "error") => void;
+}) {
   const [status, setStatus] = useState<StatusLight | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<{ available: boolean; latest?: string } | null>(null);
-  const [agents, setAgents] = useState<AgentOverview[]>([]);
+  const [agents, setAgents] = useState<AgentOverview[] | null>(null);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [backups, setBackups] = useState<BackupInfo[] | null>(null);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [savingModel, setSavingModel] = useState(false);
   const [backingUp, setBackingUp] = useState(false);
@@ -70,11 +70,6 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
 
   // Create agent dialog
   const [showCreateAgent, setShowCreateAgent] = useState(false);
-  const [newAgentId, setNewAgentId] = useState("");
-  const [newAgentModel, setNewAgentModel] = useState("");
-  const [newAgentIndependent, setNewAgentIndependent] = useState(false);
-  const [creatingAgent, setCreatingAgent] = useState(false);
-  const [createAgentError, setCreateAgentError] = useState("");
 
   // Health status with grace period: retry quickly when unhealthy, then slow-poll
   const [statusSettled, setStatusSettled] = useState(false);
@@ -91,7 +86,7 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
       } else {
         setStatusSettled(true);
       }
-    }).catch(() => {});
+    }).catch((e) => console.error("Failed to fetch status:", e));
   }, []);
 
   useEffect(() => {
@@ -101,21 +96,28 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
     return () => clearInterval(interval);
   }, [fetchStatus, statusSettled]);
 
-  const refreshAgents = () => {
-    api.listAgentsOverview().then(setAgents).catch(() => {});
+  const refreshAgents = useCallback(() => {
+    api.listAgentsOverview().then(setAgents).catch((e) => console.error("Failed to load agents:", e));
+  }, []);
+
+  useEffect(() => {
+    refreshAgents();
+    // Auto-refresh agents every 15s
+    const interval = setInterval(refreshAgents, 15000);
+    return () => clearInterval(interval);
+  }, [refreshAgents]);
+
+  useEffect(() => {
+    api.listRecipes().then((r) => setRecipes(r.slice(0, 4))).catch((e) => console.error("Failed to load recipes:", e));
+  }, []);
+
+  const refreshBackups = () => {
+    api.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
   };
-  useEffect(refreshAgents, []);
+  useEffect(refreshBackups, []);
 
   useEffect(() => {
-    api.listRecipes().then((r) => setRecipes(r.slice(0, 4))).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    api.listHistory(5, 0).then((h) => setHistory(h.items)).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    api.listModelProfiles().then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch(() => {});
+    api.listModelProfiles().then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch((e) => console.error("Failed to load model profiles:", e));
   }, []);
 
   // Match current global model value to a profile ID
@@ -132,7 +134,7 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
     return null;
   }, [status?.globalDefaultModel, modelProfiles]);
 
-  const agentGroups = useMemo(() => groupAgents(agents), [agents]);
+  const agentGroups = useMemo(() => groupAgents(agents || []), [agents]);
 
   // Heavy call: version + update check, deferred
   useEffect(() => {
@@ -145,35 +147,15 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
             latest: s.openclawUpdate.latestVersion,
           });
         }
-      }).catch(() => {});
+      }).catch((e) => console.error("Failed to fetch system status:", e));
     }, 100);
     return () => clearTimeout(timer);
   }, []);
 
-  const handleCreateAgent = () => {
-    const id = newAgentId.trim();
-    if (!id) {
-      setCreateAgentError("Agent ID is required");
-      return;
-    }
-    setCreatingAgent(true);
-    setCreateAgentError("");
-    api.createAgent(id, newAgentModel || undefined, newAgentIndependent || undefined)
-      .then(() => {
-        setShowCreateAgent(false);
-        setNewAgentId("");
-        setNewAgentModel("");
-        setNewAgentIndependent(false);
-        refreshAgents();
-      })
-      .catch((e) => setCreateAgentError(String(e)))
-      .finally(() => setCreatingAgent(false));
-  };
-
   const handleDeleteAgent = (agentId: string) => {
     api.deleteAgent(agentId)
       .then(() => refreshAgents())
-      .catch(() => {});
+      .catch((e) => showToast?.(String(e), "error"));
   };
 
   return (
@@ -223,7 +205,7 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
                           setBackupMessage(`Backup: ${info.name}`);
                           api.openUrl("https://github.com/openclaw/openclaw/releases");
                         })
-                        .catch(() => setBackupMessage("Backup failed"))
+                        .catch((e) => setBackupMessage(`Backup failed: ${e}`))
                         .finally(() => setBackingUp(false));
                     }}
                   >
@@ -246,12 +228,12 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
                     api.setGlobalModel(val === "__none__" ? null : val)
                       .then(() => api.getStatusLight())
                       .then(setStatus)
-                      .catch(() => {})
+                      .catch((e) => showToast?.(String(e), "error"))
                       .finally(() => setSavingModel(false));
                   }}
                   disabled={savingModel}
                 >
-                  <SelectTrigger className="h-8 text-sm">
+                  <SelectTrigger size="sm" className="text-sm">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -272,14 +254,19 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
           </CardContent>
         </Card>
 
-        {/* Agents Overview — grouped by identity */}
+        {/* Agents Overview -- grouped by identity */}
         <div className="flex items-center justify-between mt-6 mb-3">
           <h3 className="text-lg font-semibold">Agents</h3>
           <Button size="sm" variant="outline" onClick={() => setShowCreateAgent(true)}>
             + New Agent
           </Button>
         </div>
-        {agentGroups.length === 0 ? (
+        {agents === null ? (
+          <div className="space-y-3">
+            <Skeleton className="h-24 w-full" />
+            <Skeleton className="h-24 w-full" />
+          </div>
+        ) : agentGroups.length === 0 ? (
           <p className="text-muted-foreground">No agents found.</p>
         ) : (
           <div className="space-y-3">
@@ -351,47 +338,125 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
         ) : (
           <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
             {recipes.map((recipe) => (
-              <Card
+              <RecipeCard
                 key={recipe.id}
-                className="cursor-pointer hover:border-primary/50 transition-colors"
-                onClick={() => onCook?.(recipe.id)}
-              >
-                <CardContent>
-                  <strong>{recipe.name}</strong>
-                  <div className="text-sm text-muted-foreground mt-1.5">
-                    {recipe.description}
-                  </div>
-                  <div className="text-xs text-muted-foreground mt-2">
-                    {recipe.steps.length} step{recipe.steps.length !== 1 ? "s" : ""} &middot; {recipe.difficulty}
-                  </div>
-                </CardContent>
-              </Card>
+                recipe={recipe}
+                onCook={() => onCook?.(recipe.id)}
+                compact
+              />
             ))}
           </div>
         )}
 
-        {/* Recent Activity */}
-        <h3 className="text-lg font-semibold mt-6 mb-3">Recent Activity</h3>
-        {history.length === 0 ? (
-          <p className="text-muted-foreground">No recent activity.</p>
+        {/* Backups */}
+        <div className="flex items-center justify-between mt-6 mb-3">
+          <h3 className="text-lg font-semibold">Backups</h3>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={backingUp}
+            onClick={() => {
+              setBackingUp(true);
+              setBackupMessage("");
+              api.backupBeforeUpgrade()
+                .then((info) => {
+                  setBackupMessage(`Created backup: ${info.name}`);
+                  refreshBackups();
+                })
+                .catch((e) => setBackupMessage(`Backup failed: ${e}`))
+                .finally(() => setBackingUp(false));
+            }}
+          >
+            {backingUp ? "Creating..." : "Create Backup"}
+          </Button>
+        </div>
+        {backupMessage && (
+          <p className="text-sm text-muted-foreground mb-2">{backupMessage}</p>
+        )}
+        {backups === null ? (
+          <div className="space-y-2">
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+          </div>
+        ) : backups.length === 0 ? (
+          <p className="text-muted-foreground text-sm">No backups available.</p>
         ) : (
-          <div className="flex flex-col gap-2">
-            {history.map((item) => (
-              <Card key={item.id}>
-                <CardContent className="flex justify-between items-center">
+          <div className="space-y-2">
+            {backups.map((backup) => (
+              <Card key={backup.name}>
+                <CardContent className="flex items-center justify-between">
                   <div>
-                    <span className="font-medium">{item.recipeId || "manual change"}</span>
-                    <span className="text-sm text-muted-foreground ml-2.5">
-                      {item.source}
-                    </span>
+                    <div className="font-medium text-sm">{backup.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatTime(backup.createdAt)} — {formatBytes(backup.sizeBytes)}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2.5">
-                    {item.canRollback && (
-                      <span className="text-xs text-muted-foreground">rollback available</span>
-                    )}
-                    <span className="text-sm text-muted-foreground">
-                      {item.createdAt}
-                    </span>
+                  <div className="flex gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => api.openUrl(backup.path)}
+                    >
+                      Show
+                    </Button>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button size="sm" variant="outline">
+                          Restore
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Restore from backup?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            This will restore config and workspace files from backup "{backup.name}". Current files will be overwritten.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>Cancel</AlertDialogCancel>
+                          <AlertDialogAction
+                            onClick={() => {
+                              api.restoreFromBackup(backup.name)
+                                .then((msg) => setBackupMessage(msg))
+                                .catch((e) => setBackupMessage(`Restore failed: ${e}`));
+                            }}
+                          >
+                            Restore
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button size="sm" variant="destructive">
+                          Delete
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Delete backup?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            This will permanently delete backup "{backup.name}". This action cannot be undone.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>Cancel</AlertDialogCancel>
+                          <AlertDialogAction
+                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                            onClick={() => {
+                              api.deleteBackup(backup.name)
+                                .then(() => {
+                                  setBackupMessage(`Deleted backup "${backup.name}"`);
+                                  refreshBackups();
+                                })
+                                .catch((e) => setBackupMessage(`Delete failed: ${e}`));
+                            }}
+                          >
+                            Delete
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                   </div>
                 </CardContent>
               </Card>
@@ -400,66 +465,12 @@ export function Home({ onCook }: { onCook?: (recipeId: string, source?: string) 
         )}
 
       {/* Create Agent Dialog */}
-      <Dialog open={showCreateAgent} onOpenChange={setShowCreateAgent}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New Agent</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 py-2">
-            <div className="space-y-1.5">
-              <Label>Agent ID</Label>
-              <Input
-                placeholder="e.g. my-agent"
-                value={newAgentId}
-                onChange={(e) => setNewAgentId(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Letters, numbers, hyphens, and underscores only.
-              </p>
-            </div>
-            <div className="space-y-1.5">
-              <Label>Model</Label>
-              <Select
-                value={newAgentModel || "__default__"}
-                onValueChange={(val) => setNewAgentModel(val === "__default__" ? "" : val)}
-              >
-                <SelectTrigger className="h-8 text-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__default__">
-                    <span className="text-muted-foreground">use global default</span>
-                  </SelectItem>
-                  {modelProfiles.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.provider}/{p.model}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex items-center gap-2">
-              <Checkbox
-                id="independent-agent"
-                checked={newAgentIndependent}
-                onCheckedChange={(checked) => setNewAgentIndependent(checked === true)}
-              />
-              <Label htmlFor="independent-agent">Independent agent (separate workspace)</Label>
-            </div>
-            {createAgentError && (
-              <p className="text-sm text-destructive">{createAgentError}</p>
-            )}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowCreateAgent(false)}>
-              Cancel
-            </Button>
-            <Button onClick={handleCreateAgent} disabled={creatingAgent}>
-              {creatingAgent ? "Creating..." : "Create"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <CreateAgentDialog
+        open={showCreateAgent}
+        onOpenChange={setShowCreateAgent}
+        modelProfiles={modelProfiles}
+        onCreated={() => refreshAgents()}
+      />
     </div>
   );
 }

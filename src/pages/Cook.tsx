@@ -208,6 +208,9 @@ export function Cook({
                 Use "Apply Changes" in the sidebar to restart the gateway and activate config changes.
               </p>
             )}
+            <Button className="mt-4" onClick={onDone}>
+              Done
+            </Button>
           </CardContent>
         </Card>
       )}

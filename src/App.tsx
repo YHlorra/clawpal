@@ -6,17 +6,10 @@ import { History } from "./pages/History";
 import { Settings } from "./pages/Settings";
 import { Channels } from "./pages/Channels";
 import { Chat } from "./components/Chat";
-import { GlobalLoading } from "./components/GlobalLoading";
 import { DiffViewer } from "./components/DiffViewer";
 import { api } from "./lib/api";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
 import {
   Dialog,
   DialogContent,
@@ -39,12 +32,19 @@ import type { DiscordGuildChannel } from "./lib/types";
 
 type Route = "home" | "recipes" | "cook" | "history" | "channels" | "settings";
 
+interface ToastItem {
+  id: number;
+  message: string;
+  type: "success" | "error";
+}
+
+let toastIdCounter = 0;
+
 export function App() {
   const [route, setRoute] = useState<Route>("home");
   const [recipeId, setRecipeId] = useState<string | null>(null);
   const [recipeSource, setRecipeSource] = useState<string | undefined>(undefined);
   const [discordGuildChannels, setDiscordGuildChannels] = useState<DiscordGuildChannel[]>([]);
-  const [globalLoading, setGlobalLoading] = useState<string | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
 
   // Config dirty state
@@ -56,19 +56,19 @@ export function App() {
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState("");
   const [configVersion, setConfigVersion] = useState(0);
-  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Establish baseline on startup
   useEffect(() => {
-    api.saveConfigBaseline().catch(() => {});
+    api.saveConfigBaseline().catch((e) => console.error("Failed to save config baseline:", e));
   }, []);
 
   // Poll for dirty state
   const checkDirty = useCallback(() => {
     api.checkConfigDirty()
       .then((state) => setDirty(state.dirty))
-      .catch(() => {});
+      .catch((e) => console.error("Failed to check config dirty state:", e));
   }, []);
 
   useEffect(() => {
@@ -84,17 +84,9 @@ export function App() {
     if (!localStorage.getItem("clawpal_profiles_extracted")) {
       api.extractModelProfilesFromConfig()
         .then(() => localStorage.setItem("clawpal_profiles_extracted", "1"))
-        .catch(() => {});
+        .catch((e) => console.error("Failed to extract model profiles:", e));
     }
-    api.listDiscordGuildChannels().then(setDiscordGuildChannels).catch(() => {});
-  }, []);
-
-  const refreshDiscord = useCallback(() => {
-    setGlobalLoading("Resolving Discord channel names...");
-    api.refreshDiscordGuildChannels()
-      .then(setDiscordGuildChannels)
-      .catch(() => {})
-      .finally(() => setGlobalLoading(null));
+    api.listDiscordGuildChannels().then(setDiscordGuildChannels).catch((e) => console.error("Failed to load Discord channels:", e));
   }, []);
 
   const bumpConfigVersion = useCallback(() => {
@@ -110,13 +102,20 @@ export function App() {
         setApplyError("");
         setShowApplyDialog(true);
       })
-      .catch(() => {});
+      .catch((e) => console.error("Failed to load config diff:", e));
   };
 
-  const showToast = (message: string, type: "success" | "error" = "success") => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 3000);
-  };
+  const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
+    const id = ++toastIdCounter;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3000);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const handleApplyConfirm = () => {
     setApplying(true);
@@ -145,7 +144,6 @@ export function App() {
 
   return (
     <>
-    {globalLoading && <GlobalLoading message={globalLoading} />}
     <div className="flex h-screen">
       <aside className="w-[200px] min-w-[200px] bg-muted border-r border-border flex flex-col py-4">
         <h1 className="px-4 text-lg font-bold mb-4">ClawPal</h1>
@@ -203,18 +201,6 @@ export function App() {
           </Button>
         </nav>
 
-        {/* Chat toggle */}
-        <div className="px-2 pb-2">
-          <Button
-            variant="outline"
-            className="w-full"
-            size="sm"
-            onClick={() => setChatOpen(true)}
-          >
-            Chat
-          </Button>
-        </div>
-
         {/* Dirty config action bar */}
         {dirty && (
           <div className="px-2 pb-2 space-y-1.5">
@@ -238,7 +224,19 @@ export function App() {
           </div>
         )}
       </aside>
-      <main className="flex-1 overflow-y-auto p-4">
+      <main className="flex-1 overflow-y-auto p-4 relative">
+        {/* Chat toggle -- top-right corner */}
+        {!chatOpen && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="absolute top-4 right-4 z-10"
+            onClick={() => setChatOpen(true)}
+          >
+            Chat
+          </Button>
+        )}
+
         {route === "home" && (
           <Home
             key={configVersion}
@@ -247,6 +245,7 @@ export function App() {
               setRecipeSource(source);
               setRoute("cook");
             }}
+            showToast={showToast}
           />
         )}
         {route === "recipes" && (
@@ -272,8 +271,7 @@ export function App() {
         {route === "channels" && (
           <Channels
             key={configVersion}
-            discordGuildChannels={discordGuildChannels}
-            onRefresh={refreshDiscord}
+            showToast={showToast}
           />
         )}
         {route === "history" && <History key={configVersion} />}
@@ -281,19 +279,27 @@ export function App() {
           <Settings key={configVersion} onDataChange={bumpConfigVersion} />
         )}
       </main>
-    </div>
 
-    {/* Chat Drawer */}
-    <Sheet open={chatOpen} onOpenChange={setChatOpen}>
-      <SheetContent side="right" className="w-[380px] sm:w-[420px] p-0 flex flex-col">
-        <SheetHeader className="px-4 pt-4 pb-2">
-          <SheetTitle>Chat</SheetTitle>
-        </SheetHeader>
-        <div className="flex-1 overflow-hidden px-4 pb-4">
-          <Chat />
-        </div>
-      </SheetContent>
-    </Sheet>
+      {/* Chat Panel -- inline, pushes main content */}
+      {chatOpen && (
+        <aside className="w-[360px] min-w-[360px] border-l border-border flex flex-col bg-background">
+          <div className="flex items-center justify-between px-4 pt-4 pb-2">
+            <h2 className="text-lg font-semibold">Chat</h2>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              onClick={() => setChatOpen(false)}
+            >
+              &times;
+            </Button>
+          </div>
+          <div className="flex-1 overflow-hidden px-4 pb-4">
+            <Chat />
+          </div>
+        </aside>
+      )}
+    </div>
 
     {/* Apply Changes Dialog */}
     <Dialog open={showApplyDialog} onOpenChange={setShowApplyDialog}>
@@ -340,13 +346,26 @@ export function App() {
       </AlertDialogContent>
     </AlertDialog>
 
-    {/* Toast */}
-    {toast && (
-      <div className={cn(
-        "fixed bottom-4 right-4 px-4 py-2.5 rounded-md shadow-lg text-sm font-medium z-50 animate-in fade-in slide-in-from-bottom-2",
-        toast.type === "success" ? "bg-green-600 text-white" : "bg-destructive text-destructive-foreground"
-      )}>
-        {toast.message}
+    {/* Toast Stack */}
+    {toasts.length > 0 && (
+      <div className="fixed bottom-4 right-4 z-50 flex flex-col-reverse gap-2">
+        {toasts.map((toast) => (
+          <div
+            key={toast.id}
+            className={cn(
+              "flex items-center gap-2 px-4 py-2.5 rounded-md shadow-lg text-sm font-medium animate-in fade-in slide-in-from-bottom-2",
+              toast.type === "success" ? "bg-green-600 text-white" : "bg-destructive text-destructive-foreground"
+            )}
+          >
+            <span className="flex-1">{toast.message}</span>
+            <button
+              className="opacity-70 hover:opacity-100 text-current ml-2"
+              onClick={() => dismissToast(toast.id)}
+            >
+              &times;
+            </button>
+          </div>
+        ))}
       </div>
     )}
     </>

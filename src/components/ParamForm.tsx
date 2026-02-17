@@ -64,7 +64,7 @@ export function ParamForm({
   const needsProfiles = recipe.params.some((p) => p.type === "model_profile");
   useEffect(() => {
     if (needsProfiles) {
-      api.listModelProfiles().then(setModelProfiles).catch(() => {});
+      api.listModelProfiles().then(setModelProfiles).catch((e) => console.error("Failed to load model profiles:", e));
     }
   }, [needsProfiles]);
 
@@ -72,7 +72,7 @@ export function ParamForm({
   const needsAgents = recipe.params.some((p) => p.type === "agent");
   useEffect(() => {
     if (needsAgents) {
-      api.listAgentsOverview().then(setAgents).catch(() => {});
+      api.listAgentsOverview().then(setAgents).catch((e) => console.error("Failed to load agents:", e));
     }
   }, [needsAgents]);
 
@@ -140,7 +140,7 @@ export function ParamForm({
             }
           }}
         >
-          <SelectTrigger id={param.id} className="w-full">
+          <SelectTrigger id={param.id} size="sm" className="w-full">
             <SelectValue placeholder="Select a guild" />
           </SelectTrigger>
           <SelectContent>
@@ -165,7 +165,7 @@ export function ParamForm({
           }}
           disabled={!guildSelected}
         >
-          <SelectTrigger id={param.id} className="w-full">
+          <SelectTrigger id={param.id} size="sm" className="w-full">
             <SelectValue
               placeholder={guildSelected ? "Select a channel" : "Select a guild first"}
             />
@@ -190,7 +190,7 @@ export function ParamForm({
             setTouched((prev) => ({ ...prev, [param.id]: true }));
           }}
         >
-          <SelectTrigger id={param.id} className="w-full">
+          <SelectTrigger id={param.id} size="sm" className="w-full">
             <SelectValue placeholder="Select an agent" />
           </SelectTrigger>
           <SelectContent>
@@ -215,7 +215,7 @@ export function ParamForm({
             setTouched((prev) => ({ ...prev, [param.id]: true }));
           }}
         >
-          <SelectTrigger id={param.id} className="w-full">
+          <SelectTrigger id={param.id} size="sm" className="w-full">
             <SelectValue placeholder="Select a model" />
           </SelectTrigger>
           <SelectContent>

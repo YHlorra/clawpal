@@ -1,5 +1,16 @@
 export type Severity = "low" | "medium" | "high";
 
+export interface ChannelNode {
+  path: string;
+  channelType: string | null;
+  mode: string | null;
+  allowlist: string[];
+  model: string | null;
+  hasModelField: boolean;
+  displayName: string | null;
+  nameStatus: string | null;
+}
+
 export interface DiscordGuildChannel {
   guildId: string;
   guildName: string;

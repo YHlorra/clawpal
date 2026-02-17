@@ -941,13 +941,19 @@ pub fn create_agent(
     } else { None };
     let model_display = model_value.flatten();
 
-    // If independent, create a workspace directory for this agent
+    // If independent, create a dedicated workspace directory;
+    // otherwise inherit the default workspace so the gateway doesn't auto-create one.
     let workspace = if independent.unwrap_or(false) {
         let ws_dir = paths.base_dir.join("workspaces").join(&agent_id);
         fs::create_dir_all(&ws_dir).map_err(|e| e.to_string())?;
         let ws_path = ws_dir.to_string_lossy().to_string();
         Some(ws_path)
-    } else { None };
+    } else {
+        cfg.pointer("/agents/defaults/workspace")
+            .or_else(|| cfg.pointer("/agents/default/workspace"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    };
 
     // Build agent entry
     let mut agent_obj = serde_json::Map::new();

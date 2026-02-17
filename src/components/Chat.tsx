@@ -48,7 +48,7 @@ export function Chat() {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    api.listAgentIds().then(setAgents).catch(() => {});
+    api.listAgentIds().then(setAgents).catch((e) => console.error("Failed to load agent IDs:", e));
   }, []);
 
   useEffect(() => {
@@ -90,7 +90,7 @@ export function Chat() {
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 mb-2">
         <Select value={agentId} onValueChange={(a) => { setAgentId(a); setSessionId(loadSessionId(a)); setMessages([]); }}>
-          <SelectTrigger className="w-auto h-7 text-xs">
+          <SelectTrigger size="sm" className="w-auto text-xs">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

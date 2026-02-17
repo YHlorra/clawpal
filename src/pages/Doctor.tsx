@@ -96,7 +96,7 @@ export function Doctor() {
   }, []);
 
   useEffect(() => {
-    api.listBackups().then(setBackups).catch(() => {});
+    api.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
   }, []);
 
   return (

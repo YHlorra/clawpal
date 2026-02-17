@@ -11,18 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { HistoryItem, PreviewResult } from "../lib/types";
-
-/** Parse "2026-02-17T14-30-00-recipe" style timestamps to local YYYY-MM-DD HH:MM:SS */
-function formatHistoryTime(raw: string): string {
-  // createdAt is like "2026-02-17T14-30-00" (UTC)
-  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
-  if (!match) return raw;
-  const [, y, mo, d, h, mi, s] = match;
-  const utc = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}Z`);
-  if (isNaN(utc.getTime())) return raw;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${utc.getFullYear()}-${pad(utc.getMonth() + 1)}-${pad(utc.getDate())} ${pad(utc.getHours())}:${pad(utc.getMinutes())}:${pad(utc.getSeconds())}`;
-}
+import { formatTime } from "@/lib/utils";
 
 export function History() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -54,13 +43,13 @@ export function History() {
             <Card key={item.id} className={isRollback ? "border-dashed opacity-75" : ""}>
               <CardContent>
                 <div className="flex items-center gap-2 text-sm flex-wrap">
-                  <span className="text-muted-foreground">{formatHistoryTime(item.createdAt)}</span>
+                  <span className="text-muted-foreground">{formatTime(item.createdAt)}</span>
                   {isRollback ? (
                     <>
                       <Badge variant="outline">rollback</Badge>
                       <span className="text-muted-foreground">
                         Reverted {rollbackTarget
-                          ? `"${rollbackTarget.recipeId || "manual"}" from ${formatHistoryTime(rollbackTarget.createdAt)}`
+                          ? `"${rollbackTarget.recipeId || "manual"}" from ${formatTime(rollbackTarget.createdAt)}`
                           : item.recipeId || "unknown"
                         }
                       </span>
