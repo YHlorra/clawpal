@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
 import type { ModelCatalogProvider, ModelProfile, ResolvedApiKey } from "@/lib/types";
@@ -8,17 +8,6 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Command,
-  CommandInput,
-  CommandList,
-  CommandEmpty,
-  CommandGroup,
-  CommandItem,
-} from "@/components/ui/command";
-import { ChevronsUpDown, Check } from "lucide-react";
-import { cn } from "@/lib/utils";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -53,108 +42,74 @@ function emptyForm(): ProfileForm {
   };
 }
 
-function ComboboxField({
+function AutocompleteField({
   value,
   onChange,
-  onOpen,
+  onFocus,
   options,
   placeholder,
 }: {
   value: string;
   onChange: (val: string) => void;
-  onOpen?: () => void;
+  onFocus?: () => void;
   options: { value: string; label: string }[];
   placeholder: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  const filtered = options.filter(
+    (o) =>
+      !value ||
+      o.value.toLowerCase().includes(value.toLowerCase()) ||
+      o.label.toLowerCase().includes(value.toLowerCase()),
+  );
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   return (
-    <Popover
-      open={open}
-      onOpenChange={(o) => {
-        setOpen(o);
-        if (o && onOpen) onOpen();
-      }}
-    >
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal"
-        >
-          {value || (
-            <span className="text-muted-foreground">{placeholder}</span>
-          )}
-          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[--radix-popover-trigger-width] p-0"
-        align="start"
-      >
-        <Command shouldFilter={false}>
-          <CommandInput
-            placeholder={`Search ${placeholder.replace("e.g. ", "")}...`}
-            value={search}
-            onValueChange={setSearch}
-          />
-          <CommandList>
-            <CommandEmpty>No results found.</CommandEmpty>
-            <CommandGroup>
-              {/* Show typed value as option if it doesn't match any existing option */}
-              {search &&
-                !options.some(
-                  (o) => o.value.toLowerCase() === search.toLowerCase(),
-                ) && (
-                  <CommandItem
-                    onSelect={() => {
-                      onChange(search);
-                      setOpen(false);
-                      setSearch("");
-                    }}
-                  >
-                    <Check
-                      className={cn(
-                        "mr-2 h-4 w-4",
-                        value === search ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                    Use "{search}"
-                  </CommandItem>
-                )}
-              {options
-                .filter(
-                  (o) =>
-                    !search ||
-                    o.value.toLowerCase().includes(search.toLowerCase()) ||
-                    o.label.toLowerCase().includes(search.toLowerCase()),
-                )
-                .map((option) => (
-                  <CommandItem
-                    key={option.value}
-                    onSelect={() => {
-                      onChange(option.value);
-                      setOpen(false);
-                      setSearch("");
-                    }}
-                  >
-                    <Check
-                      className={cn(
-                        "mr-2 h-4 w-4",
-                        value === option.value ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                    {option.label}
-                  </CommandItem>
-                ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
+    <div ref={wrapperRef} className="relative">
+      <Input
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => {
+          setOpen(true);
+          onFocus?.();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setOpen(false);
+        }}
+      />
+      {open && filtered.length > 0 && (
+        <div className="absolute z-50 w-full mt-1 bg-popover border border-border rounded-md shadow-md max-h-[200px] overflow-y-auto">
+          {filtered.map((option) => (
+            <div
+              key={option.value}
+              className="px-3 py-1.5 text-sm cursor-pointer hover:bg-accent hover:text-accent-foreground"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onChange(option.value);
+                setOpen(false);
+              }}
+            >
+              {option.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -272,12 +227,12 @@ export function Settings() {
             <form onSubmit={upsert} className="space-y-4">
               <div className="space-y-1.5">
                 <Label>Provider</Label>
-                <ComboboxField
+                <AutocompleteField
                   value={form.provider}
                   onChange={(val) =>
                     setForm((p) => ({ ...p, provider: val, model: "" }))
                   }
-                  onOpen={ensureCatalog}
+                  onFocus={ensureCatalog}
                   options={catalog.map((c) => ({
                     value: c.provider,
                     label: c.provider,
@@ -288,12 +243,12 @@ export function Settings() {
 
               <div className="space-y-1.5">
                 <Label>Model</Label>
-                <ComboboxField
+                <AutocompleteField
                   value={form.model}
                   onChange={(val) =>
                     setForm((p) => ({ ...p, model: val }))
                   }
-                  onOpen={ensureCatalog}
+                  onFocus={ensureCatalog}
                   options={modelCandidates.map((m) => ({
                     value: m.id,
                     label: m.name || m.id,
