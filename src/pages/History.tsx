@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { useInstance } from "@/lib/instance-context";
 import { DiffViewer } from "../components/DiffViewer";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -14,18 +15,23 @@ import type { HistoryItem, PreviewResult } from "../lib/types";
 import { formatTime } from "@/lib/utils";
 
 export function History() {
+  const { instanceId, isRemote, isConnected } = useInstance();
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [message, setMessage] = useState("");
 
-  const refreshHistory = () =>
-    api.listHistory(50, 0)
+  const refreshHistory = () => {
+    const promise = isRemote && isConnected
+      ? api.remoteListHistory(instanceId)
+      : api.listHistory(50, 0);
+    return promise
       .then((resp) => setHistory(resp.items))
       .catch(() => setMessage("Failed to load history"));
+  };
 
   useEffect(() => {
     refreshHistory();
-  }, []);
+  }, [instanceId, isRemote, isConnected]);
 
   // Build a map from snapshot ID to its display info for rollback references
   const historyMap = new Map(
@@ -64,7 +70,7 @@ export function History() {
                     <Badge variant="outline" className="text-muted-foreground">not rollbackable</Badge>
                   )}
                 </div>
-                {!isRollback && (
+                {!isRollback && !isRemote && (
                   <div className="flex gap-2 mt-2">
                     <Button
                       variant="outline"

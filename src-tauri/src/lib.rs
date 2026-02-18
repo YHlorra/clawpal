@@ -20,6 +20,18 @@ use crate::commands::{
     ssh_connect, ssh_disconnect, ssh_status,
     ssh_exec, sftp_read_file, sftp_write_file, sftp_list_dir, sftp_remove_file,
     remote_read_raw_config, remote_get_system_status,
+    remote_list_agents_overview, remote_list_channels_minimal, remote_list_bindings,
+    remote_restart_gateway, remote_apply_config_patch,
+    remote_create_agent, remote_delete_agent,
+    remote_assign_channel_agent, remote_set_global_model,
+    remote_run_doctor, remote_list_history, remote_list_discord_guild_channels, remote_write_raw_config,
+    remote_analyze_sessions, remote_delete_sessions_by_ids,
+    remote_list_session_files, remote_clear_all_sessions, remote_preview_session,
+    remote_list_model_profiles, remote_upsert_model_profile, remote_delete_model_profile, remote_resolve_api_keys,
+    remote_extract_model_profiles_from_config, remote_refresh_model_catalog,
+    remote_chat_via_openclaw, remote_check_openclaw_update,
+    remote_save_config_baseline, remote_check_config_dirty, remote_discard_config_changes, remote_apply_pending_changes,
+    RemoteConfigBaselines,
 };
 use crate::ssh::SshConnectionPool;
 
@@ -34,6 +46,7 @@ pub mod ssh;
 pub fn run() {
     tauri::Builder::default()
         .manage(SshConnectionPool::new())
+        .manage(RemoteConfigBaselines::new())
         .invoke_handler(tauri::generate_handler![
             get_system_status,
             get_status_light,
@@ -101,6 +114,36 @@ pub fn run() {
             sftp_remove_file,
             remote_read_raw_config,
             remote_get_system_status,
+            remote_list_agents_overview,
+            remote_list_channels_minimal,
+            remote_list_bindings,
+            remote_restart_gateway,
+            remote_apply_config_patch,
+            remote_create_agent,
+            remote_delete_agent,
+            remote_assign_channel_agent,
+            remote_set_global_model,
+            remote_run_doctor,
+            remote_list_history,
+            remote_list_discord_guild_channels,
+            remote_write_raw_config,
+            remote_analyze_sessions,
+            remote_delete_sessions_by_ids,
+            remote_list_session_files,
+            remote_clear_all_sessions,
+            remote_preview_session,
+            remote_list_model_profiles,
+            remote_upsert_model_profile,
+            remote_delete_model_profile,
+            remote_resolve_api_keys,
+            remote_extract_model_profiles_from_config,
+            remote_refresh_model_catalog,
+            remote_chat_via_openclaw,
+            remote_check_openclaw_update,
+            remote_save_config_baseline,
+            remote_check_config_dirty,
+            remote_discard_config_changes,
+            remote_apply_pending_changes,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run app");

@@ -1,7 +1,12 @@
 import { api } from "./api";
 
+export interface ActionContext {
+  instanceId: string;
+  isRemote: boolean;
+}
+
 export interface ActionDef {
-  execute: (args: Record<string, unknown>) => Promise<unknown>;
+  execute: (args: Record<string, unknown>, ctx?: ActionContext) => Promise<unknown>;
   describe: (args: Record<string, unknown>) => string;
 }
 
@@ -35,11 +40,15 @@ function renderArgs(
 
 const registry: Record<string, ActionDef> = {
   create_agent: {
-    execute: (args) => {
+    execute: (args, ctx) => {
       const model = args.modelProfileId as string | undefined;
+      const cleanModel = model === "__default__" ? undefined : model;
+      if (ctx?.isRemote) {
+        return api.remoteCreateAgent(ctx.instanceId, args.agentId as string, cleanModel);
+      }
       return api.createAgent(
         args.agentId as string,
-        model === "__default__" ? undefined : model,
+        cleanModel,
         args.independent as boolean | undefined,
       );
     },
@@ -50,37 +59,61 @@ const registry: Record<string, ActionDef> = {
     },
   },
   setup_identity: {
-    execute: (args) =>
-      api.setupAgentIdentity(
+    execute: (args, ctx) => {
+      if (ctx?.isRemote) return Promise.resolve(); // Not supported for remote yet — skip silently
+      return api.setupAgentIdentity(
         args.agentId as string,
         args.name as string,
         args.emoji as string | undefined,
-      ),
+      );
+    },
     describe: (args) => {
       const emoji = args.emoji ? ` ${args.emoji}` : "";
       return `Set identity: ${args.name}${emoji}`;
     },
   },
   bind_channel: {
-    execute: (args) =>
-      api.assignChannelAgent(
+    execute: (args, ctx) => {
+      if (ctx?.isRemote) {
+        return api.remoteAssignChannelAgent(
+          ctx.instanceId,
+          args.channelType as string,
+          args.peerId as string,
+          args.agentId as string,
+        );
+      }
+      return api.assignChannelAgent(
         args.channelType as string,
         args.peerId as string,
         args.agentId as string,
-      ),
+      );
+    },
     describe: (args) =>
       `Bind ${args.channelType} channel → agent "${args.agentId}"`,
   },
   config_patch: {
-    execute: (args) =>
-      api.applyConfigPatch(
+    execute: (args, ctx) => {
+      if (ctx?.isRemote) {
+        return api.remoteApplyConfigPatch(
+          ctx.instanceId,
+          args.patchTemplate as string,
+          args.params as Record<string, string>,
+        );
+      }
+      return api.applyConfigPatch(
         args.patchTemplate as string,
         args.params as Record<string, string>,
-      ),
+      );
+    },
     describe: () => "",
   },
   set_global_model: {
-    execute: (args) => api.setGlobalModel(args.profileId as string),
+    execute: (args, ctx) => {
+      if (ctx?.isRemote) {
+        return api.remoteSetGlobalModel(ctx.instanceId, args.profileId as string);
+      }
+      return api.setGlobalModel(args.profileId as string);
+    },
     describe: (args) => `Set default model to ${args.profileId}`,
   },
 };
@@ -131,10 +164,10 @@ export function resolveSteps(
   });
 }
 
-export async function executeStep(step: ResolvedStep): Promise<void> {
+export async function executeStep(step: ResolvedStep, ctx?: ActionContext): Promise<void> {
   const actionDef = getAction(step.action);
   if (!actionDef) {
     throw new Error(`Unknown action type: ${step.action}`);
   }
-  await actionDef.execute(step.args);
+  await actionDef.execute(step.args, ctx);
 }

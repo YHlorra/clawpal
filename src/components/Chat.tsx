@@ -11,6 +11,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useInstance } from "@/lib/instance-context";
 
 interface Message {
   role: "user" | "assistant";
@@ -39,6 +40,7 @@ Rules:
 User message: `;
 
 export function Chat() {
+  const { instanceId, isRemote, isConnected } = useInstance();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -48,8 +50,15 @@ export function Chat() {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    api.listAgentIds().then(setAgents).catch((e) => console.error("Failed to load agent IDs:", e));
-  }, []);
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteListAgentsOverview(instanceId)
+        .then((agents) => setAgents(agents.map((a) => a.id)))
+        .catch((e) => console.error("Failed to load remote agent IDs:", e));
+    } else {
+      api.listAgentIds().then(setAgents).catch((e) => console.error("Failed to load agent IDs:", e));
+    }
+  }, [isRemote, isConnected, instanceId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -66,7 +75,9 @@ export function Chat() {
     try {
       // Inject ClawPal context on first message of a session
       const payload = sessionId ? userMsg.content : CLAWPAL_CONTEXT + userMsg.content;
-      const result = await api.chatViaOpenclaw(agentId, payload, sessionId);
+      const result = isRemote
+        ? await api.remoteChatViaOpenclaw(instanceId, agentId, payload, sessionId)
+        : await api.chatViaOpenclaw(agentId, payload, sessionId);
       // Extract session ID for conversation continuity
       const meta = result.meta as Record<string, unknown> | undefined;
       const agentMeta = meta?.agentMeta as Record<string, unknown> | undefined;
@@ -84,7 +95,7 @@ export function Chat() {
     } finally {
       setLoading(false);
     }
-  }, [input, loading, agentId, sessionId]);
+  }, [input, loading, agentId, sessionId, isRemote, instanceId]);
 
   return (
     <div className="flex flex-col h-full">

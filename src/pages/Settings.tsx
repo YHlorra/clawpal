@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
+import { useInstance } from "@/lib/instance-context";
 import type { ModelCatalogProvider, ModelProfile, ProviderAuthSuggestion, ResolvedApiKey } from "@/lib/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -114,6 +115,7 @@ function AutocompleteField({
 }
 
 export function Settings({ onDataChange }: { onDataChange?: () => void }) {
+  const { instanceId, isRemote, isConnected } = useInstance();
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [catalog, setCatalog] = useState<ModelCatalogProvider[]>([]);
   const [apiKeys, setApiKeys] = useState<ResolvedApiKey[]>([]);
@@ -123,38 +125,54 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
 
   const [catalogRefreshed, setCatalogRefreshed] = useState(false);
 
-  // Load profiles and API keys immediately (fast)
+  // Extract profiles from remote config on first load
+  useEffect(() => {
+    if (!isRemote || !isConnected) return;
+    api.remoteExtractModelProfilesFromConfig(instanceId)
+      .catch((e) => console.error("Failed to extract remote profiles:", e));
+  }, [isRemote, isConnected, instanceId]);
+
   const refreshProfiles = () => {
-    api.listModelProfiles().then(setProfiles).catch((e) => console.error("Failed to load profiles:", e));
-    api.resolveApiKeys().then(setApiKeys).catch((e) => console.error("Failed to resolve API keys:", e));
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteListModelProfiles(instanceId).then(setProfiles).catch((e) => console.error("Failed to load remote profiles:", e));
+      api.remoteResolveApiKeys(instanceId).then(setApiKeys).catch((e) => console.error("Failed to resolve remote API keys:", e));
+    } else {
+      api.listModelProfiles().then(setProfiles).catch((e) => console.error("Failed to load profiles:", e));
+      api.resolveApiKeys().then(setApiKeys).catch((e) => console.error("Failed to resolve API keys:", e));
+    }
   };
 
-  useEffect(refreshProfiles, []);
+  useEffect(refreshProfiles, [isRemote, isConnected, instanceId]);
 
   // Load catalog from cache instantly (no CLI calls)
   useEffect(() => {
-    api.getCachedModelCatalog().then(setCatalog).catch((e) => console.error("Failed to load model catalog:", e));
-  }, []);
+    setCatalogRefreshed(false);
+    if (isRemote) {
+      // For remote, load catalog on mount (no local cache)
+      if (isConnected) {
+        api.remoteRefreshModelCatalog(instanceId).then(setCatalog).catch((e) => console.error("Failed to load remote model catalog:", e));
+      }
+    } else {
+      api.getCachedModelCatalog().then(setCatalog).catch((e) => console.error("Failed to load model catalog:", e));
+    }
+  }, [isRemote, isConnected, instanceId]);
 
   // Refresh catalog from CLI when user focuses provider/model input
   const ensureCatalog = () => {
     if (catalogRefreshed) return;
     setCatalogRefreshed(true);
-    api.refreshModelCatalog().then((fresh) => {
-      if (fresh.length > 0) setCatalog(fresh);
-    }).catch((e) => console.error("Failed to refresh model catalog:", e));
-  };
-
-  // Check for existing auth when provider changes (only for new profiles)
-  useEffect(() => {
-    if (form.id || !form.provider.trim()) {
-      setAuthSuggestion(null);
-      return;
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteRefreshModelCatalog(instanceId).then((fresh) => {
+        if (fresh.length > 0) setCatalog(fresh);
+      }).catch((e) => console.error("Failed to refresh remote model catalog:", e));
+    } else {
+      api.refreshModelCatalog().then((fresh) => {
+        if (fresh.length > 0) setCatalog(fresh);
+      }).catch((e) => console.error("Failed to refresh model catalog:", e));
     }
-    api.resolveProviderAuth(form.provider)
-      .then(setAuthSuggestion)
-      .catch((e) => { console.error("Failed to resolve provider auth:", e); setAuthSuggestion(null); });
-  }, [form.provider, form.id]);
+  };
 
   const maskedKeyMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -163,6 +181,33 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
     }
     return map;
   }, [apiKeys]);
+
+  // Check for existing auth when provider changes
+  useEffect(() => {
+    if (form.id || !form.provider.trim()) {
+      setAuthSuggestion(null);
+      return;
+    }
+    if (isRemote) {
+      // For remote: check if any existing profile with the same provider already has a key
+      const sameProviderProfile = profiles.find(
+        (p) => p.provider === form.provider && maskedKeyMap.has(p.id) && maskedKeyMap.get(p.id) !== "..."
+      );
+      if (sameProviderProfile) {
+        setAuthSuggestion({
+          hasKey: true,
+          source: `existing profile (${sameProviderProfile.provider}/${sameProviderProfile.model})`,
+          authRef: sameProviderProfile.authRef || "",
+        });
+      } else {
+        setAuthSuggestion(null);
+      }
+    } else {
+      api.resolveProviderAuth(form.provider)
+        .then(setAuthSuggestion)
+        .catch((e) => { console.error("Failed to resolve provider auth:", e); setAuthSuggestion(null); });
+    }
+  }, [form.provider, form.id, isRemote, profiles, maskedKeyMap]);
 
   const modelCandidates = useMemo(() => {
     const found = catalog.find((c) => c.provider === form.provider);
@@ -175,7 +220,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
       setMessage("Provider and Model are required");
       return;
     }
-    if (!form.apiKey && !form.id && !authSuggestion?.hasKey) {
+    if (!isRemote && !form.apiKey && !form.id && !authSuggestion?.hasKey) {
       setMessage("API Key is required");
       return;
     }
@@ -189,8 +234,10 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
       baseUrl: form.useCustomUrl && form.baseUrl ? form.baseUrl : undefined,
       enabled: form.enabled,
     };
-    api
-      .upsertModelProfile(profileData)
+    const upsertPromise = isRemote
+      ? api.remoteUpsertModelProfile(instanceId, profileData)
+      : api.upsertModelProfile(profileData);
+    upsertPromise
       .then(() => {
         setMessage("Profile saved");
         setForm(emptyForm());
@@ -213,8 +260,10 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
   };
 
   const deleteProfile = (id: string) => {
-    api
-      .deleteModelProfile(id)
+    const deletePromise = isRemote
+      ? api.remoteDeleteModelProfile(instanceId, id)
+      : api.deleteModelProfile(id);
+    deletePromise
       .then(() => {
         setMessage("Profile deleted");
         if (form.id === id) {
@@ -230,213 +279,215 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
     <section>
       <h2 className="text-2xl font-bold mb-4">Settings</h2>
 
-      <p className="text-sm text-muted-foreground mb-4">
-        For OAuth-based providers (GitHub Copilot, etc.), use the CLI:
-        <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login</code>
-        or
-        <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login-github-copilot</code>.
-        Profiles created via CLI will appear in the list on the right.
-      </p>
-
       {/* ---- Model Profiles ---- */}
-      <div className="grid grid-cols-2 gap-3 items-start">
-        {/* Create / Edit form */}
-        <Card>
-          <CardHeader>
-            <CardTitle>{form.id ? "Edit Profile" : "Add Profile"}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={upsert} className="space-y-4">
-              <div className="space-y-1.5">
-                <Label>Provider</Label>
-                <AutocompleteField
-                  value={form.provider}
-                  onChange={(val) =>
-                    setForm((p) => ({ ...p, provider: val, model: "" }))
-                  }
-                  onFocus={ensureCatalog}
-                  options={catalog.map((c) => ({
-                    value: c.provider,
-                    label: c.provider,
-                  }))}
-                  placeholder="e.g. openai"
-                />
-              </div>
+      {!isRemote && (
+        <p className="text-sm text-muted-foreground mb-4">
+          For OAuth-based providers (GitHub Copilot, etc.), use the CLI:
+          <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login</code>
+          or
+          <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login-github-copilot</code>.
+          Profiles created via CLI will appear in the list on the right.
+        </p>
+      )}
 
-              <div className="space-y-1.5">
-                <Label>Model</Label>
-                <AutocompleteField
-                  value={form.model}
-                  onChange={(val) =>
-                    setForm((p) => ({ ...p, model: val }))
-                  }
-                  onFocus={ensureCatalog}
-                  options={modelCandidates.map((m) => ({
-                    value: m.id,
-                    label: m.name || m.id,
-                  }))}
-                  placeholder="e.g. gpt-4o"
-                />
-              </div>
+          <div className="grid grid-cols-2 gap-3 items-start">
+            {/* Create / Edit form */}
+            <Card>
+              <CardHeader>
+                <CardTitle>{form.id ? "Edit Profile" : "Add Profile"}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <form onSubmit={upsert} className="space-y-4">
+                  <div className="space-y-1.5">
+                    <Label>Provider</Label>
+                    <AutocompleteField
+                      value={form.provider}
+                      onChange={(val) =>
+                        setForm((p) => ({ ...p, provider: val, model: "" }))
+                      }
+                      onFocus={ensureCatalog}
+                      options={catalog.map((c) => ({
+                        value: c.provider,
+                        label: c.provider,
+                      }))}
+                      placeholder="e.g. openai"
+                    />
+                  </div>
 
-              <div className="space-y-1.5">
-                <Label>API Key</Label>
-                <Input
-                  type="password"
-                  placeholder={form.id ? "(unchanged if empty)" : authSuggestion?.hasKey ? "(optional — key already available)" : "sk-..."}
-                  value={form.apiKey}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, apiKey: e.target.value }))
-                  }
-                />
-                {!form.id && authSuggestion?.hasKey && (
-                  <p className="text-xs text-muted-foreground">
-                    Key available via {authSuggestion.source}. Leave empty to reuse it.
-                  </p>
-                )}
-              </div>
+                  <div className="space-y-1.5">
+                    <Label>Model</Label>
+                    <AutocompleteField
+                      value={form.model}
+                      onChange={(val) =>
+                        setForm((p) => ({ ...p, model: val }))
+                      }
+                      onFocus={ensureCatalog}
+                      options={modelCandidates.map((m) => ({
+                        value: m.id,
+                        label: m.name || m.id,
+                      }))}
+                      placeholder="e.g. gpt-4o"
+                    />
+                  </div>
 
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="custom-url"
-                  checked={form.useCustomUrl}
-                  onCheckedChange={(checked) =>
-                    setForm((p) => ({ ...p, useCustomUrl: checked === true }))
-                  }
-                />
-                <Label htmlFor="custom-url">Custom Base URL</Label>
-              </div>
-
-              {form.useCustomUrl && (
-                <div className="space-y-1.5">
-                  <Label>Base URL</Label>
-                  <Input
-                    placeholder="e.g. https://api.openai.com/v1"
-                    value={form.baseUrl}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, baseUrl: e.target.value }))
-                    }
-                  />
-                </div>
-              )}
-
-              <div className="flex gap-2 mt-2">
-                <Button type="submit">Save</Button>
-                {form.id && (
-                  <>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button type="button" variant="destructive">
-                          Delete
-                        </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Delete profile?</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            This will permanently delete the profile "{form.provider}/{form.model}". This action cannot be undone.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel>Cancel</AlertDialogCancel>
-                          <AlertDialogAction
-                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                            onClick={() => deleteProfile(form.id)}
-                          >
-                            Delete
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => setForm(emptyForm())}
-                    >
-                      Cancel
-                    </Button>
-                  </>
-                )}
-              </div>
-            </form>
-          </CardContent>
-        </Card>
-
-        {/* Profiles list */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Model Profiles</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {profiles.length === 0 && (
-              <p className="text-muted-foreground">No model profiles yet.</p>
-            )}
-            <div className="grid gap-2">
-              {profiles.map((profile) => (
-                <div
-                  key={profile.id}
-                  className="border border-border p-2.5 rounded-lg"
-                >
-                  <div className="flex justify-between items-center">
-                    <strong>{profile.provider}/{profile.model}</strong>
-                    {profile.enabled ? (
-                      <Badge className="bg-blue-100 text-blue-700 border-0">
-                        enabled
-                      </Badge>
-                    ) : (
-                      <Badge className="bg-red-100 text-red-700 border-0">
-                        disabled
-                      </Badge>
+                  <div className="space-y-1.5">
+                    <Label>API Key</Label>
+                    <Input
+                      type="password"
+                      placeholder={form.id ? "(unchanged if empty)" : authSuggestion?.hasKey ? "(optional — key already available)" : "sk-..."}
+                      value={form.apiKey}
+                      onChange={(e) =>
+                        setForm((p) => ({ ...p, apiKey: e.target.value }))
+                      }
+                    />
+                    {!form.id && authSuggestion?.hasKey && (
+                      <p className="text-xs text-muted-foreground">
+                        Key available via {authSuggestion.source}. Leave empty to reuse it.
+                      </p>
                     )}
                   </div>
-                  <div className="text-sm text-muted-foreground mt-1">
-                    API Key: {maskedKeyMap.get(profile.id) || "..."}
+
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="custom-url"
+                      checked={form.useCustomUrl}
+                      onCheckedChange={(checked) =>
+                        setForm((p) => ({ ...p, useCustomUrl: checked === true }))
+                      }
+                    />
+                    <Label htmlFor="custom-url">Custom Base URL</Label>
                   </div>
-                  {profile.baseUrl && (
-                    <div className="text-sm text-muted-foreground mt-0.5">
-                      URL: {profile.baseUrl}
+
+                  {form.useCustomUrl && (
+                    <div className="space-y-1.5">
+                      <Label>Base URL</Label>
+                      <Input
+                        placeholder="e.g. https://api.openai.com/v1"
+                        value={form.baseUrl}
+                        onChange={(e) =>
+                          setForm((p) => ({ ...p, baseUrl: e.target.value }))
+                        }
+                      />
                     </div>
                   )}
-                  <div className="flex gap-1.5 mt-1.5">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      type="button"
-                      onClick={() => editProfile(profile)}
-                    >
-                      Edit
-                    </Button>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button size="sm" variant="destructive" type="button">
-                          Delete
+
+                  <div className="flex gap-2 mt-2">
+                    <Button type="submit">Save</Button>
+                    {form.id && (
+                      <>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button type="button" variant="destructive">
+                              Delete
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Delete profile?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will permanently delete the profile "{form.provider}/{form.model}". This action cannot be undone.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                onClick={() => deleteProfile(form.id)}
+                              >
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => setForm(emptyForm())}
+                        >
+                          Cancel
                         </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Delete profile?</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            This will permanently delete the profile "{profile.provider}/{profile.model}". This action cannot be undone.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel>Cancel</AlertDialogCancel>
-                          <AlertDialogAction
-                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                            onClick={() => deleteProfile(profile.id)}
-                          >
-                            Delete
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
+                      </>
+                    )}
                   </div>
+                </form>
+              </CardContent>
+            </Card>
+
+            {/* Profiles list */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Model Profiles</CardTitle>
+              </CardHeader>
+              <CardContent>
+                {profiles.length === 0 && (
+                  <p className="text-muted-foreground">No model profiles yet.</p>
+                )}
+                <div className="grid gap-2">
+                  {profiles.map((profile) => (
+                    <div
+                      key={profile.id}
+                      className="border border-border p-2.5 rounded-lg"
+                    >
+                      <div className="flex justify-between items-center">
+                        <strong>{profile.provider}/{profile.model}</strong>
+                        {profile.enabled ? (
+                          <Badge className="bg-blue-100 text-blue-700 border-0">
+                            enabled
+                          </Badge>
+                        ) : (
+                          <Badge className="bg-red-100 text-red-700 border-0">
+                            disabled
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="text-sm text-muted-foreground mt-1">
+                        API Key: {maskedKeyMap.get(profile.id) || "..."}
+                      </div>
+                      {profile.baseUrl && (
+                        <div className="text-sm text-muted-foreground mt-0.5">
+                          URL: {profile.baseUrl}
+                        </div>
+                      )}
+                      <div className="flex gap-1.5 mt-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          type="button"
+                          onClick={() => editProfile(profile)}
+                        >
+                          Edit
+                        </Button>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button size="sm" variant="destructive" type="button">
+                              Delete
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Delete profile?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will permanently delete the profile "{profile.provider}/{profile.model}". This action cannot be undone.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                onClick={() => deleteProfile(profile.id)}
+                              >
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+              </CardContent>
+            </Card>
+          </div>
 
       {message && (
         <p className="text-sm text-muted-foreground mt-3">{message}</p>

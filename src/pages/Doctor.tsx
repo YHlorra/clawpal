@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { api } from "@/lib/api";
+import { useInstance } from "@/lib/instance-context";
 import { initialState, reducer } from "@/lib/state";
 import type { AgentSessionAnalysis, BackupInfo, MemoryFile, SessionFile } from "@/lib/types";
 import {
@@ -42,7 +43,9 @@ function formatBytes(bytes: number) {
 }
 
 export function Doctor() {
+  const { instanceId, isRemote, isConnected } = useInstance();
   const [state, dispatch] = useReducer(reducer, initialState);
+  const [rawOutput, setRawOutput] = useState<string | null>(null);
   const [memoryFiles, setMemoryFiles] = useState<MemoryFile[]>([]);
   const [sessionFiles, setSessionFiles] = useState<SessionFile[]>([]);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
@@ -90,15 +93,37 @@ export function Doctor() {
     [sessionFiles],
   );
 
+  function runDoctorCmd(): Promise<import("@/lib/types").DoctorReport> {
+    if (isRemote && isConnected) {
+      return api.remoteRunDoctor(instanceId).then((report) => {
+        // Remote doctor may return a rawOutput field instead of structured issues
+        const raw = (report as unknown as Record<string, unknown>).rawOutput;
+        if (raw && typeof raw === "string") {
+          setRawOutput(raw);
+        } else {
+          setRawOutput(null);
+        }
+        return report;
+      });
+    }
+    setRawOutput(null);
+    return api.runDoctor();
+  }
+
   function refreshData() {
-    api
-      .listMemoryFiles()
-      .then(setMemoryFiles)
-      .catch(() => setDataMessage("Failed to load memory files"));
-    api
-      .listSessionFiles()
-      .then(setSessionFiles)
-      .catch(() => setDataMessage("Failed to load session files"));
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteListSessionFiles(instanceId)
+        .then(setSessionFiles)
+        .catch(() => setDataMessage("Failed to load remote session files"));
+    } else {
+      api.listMemoryFiles()
+        .then(setMemoryFiles)
+        .catch(() => setDataMessage("Failed to load memory files"));
+      api.listSessionFiles()
+        .then(setSessionFiles)
+        .catch(() => setDataMessage("Failed to load session files"));
+    }
   }
 
   function removeSessionsFromAnalysis(agent: string, deletedIds: Set<string>) {
@@ -123,14 +148,15 @@ export function Doctor() {
   }
 
   useEffect(() => {
-    api
-      .runDoctor()
-      .then((report) => dispatch({ type: "setDoctor", doctor: report }))
-      .catch(() =>
-        dispatch({ type: "setMessage", message: "Failed to run doctor" }),
-      );
+    if (!isRemote) {
+      runDoctorCmd()
+        .then((report) => dispatch({ type: "setDoctor", doctor: report }))
+        .catch(() =>
+          dispatch({ type: "setMessage", message: "Failed to run doctor" }),
+        );
+    }
     refreshData();
-  }, []);
+  }, [instanceId, isRemote, isConnected]);
 
   useEffect(() => {
     api.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
@@ -140,118 +166,120 @@ export function Doctor() {
     <section>
       <h2 className="text-2xl font-bold mb-4">Doctor</h2>
 
-      {/* Config Diagnostics */}
-      {state.doctor && (
-        <div>
-          <p className="text-sm text-muted-foreground mb-3">
-            Health score: {state.doctor.score}
-          </p>
-          <div className="space-y-2">
-            {state.doctor.issues.map((issue) => (
-              <div
-                key={issue.id}
-                className="flex items-center gap-2 text-sm"
-              >
-                {issue.severity === "error" && (
-                  <Badge variant="destructive">ERROR</Badge>
-                )}
-                {issue.severity === "warn" && (
-                  <Badge variant="secondary">WARN</Badge>
-                )}
-                {issue.severity === "info" && (
-                  <Badge variant="outline">INFO</Badge>
-                )}
-                <span>{issue.message}</span>
-                {issue.autoFixable && (
-                  <Button
-                    size="sm"
-                    onClick={() => {
-                      api
-                        .fixIssues([issue.id])
-                        .then(() => api.runDoctor())
-                        .then((report) =>
-                          dispatch({ type: "setDoctor", doctor: report }),
-                        )
-                        .catch(() =>
-                          dispatch({
-                            type: "setMessage",
-                            message: "Failed to fix issue",
-                          }),
-                        );
-                    }}
+      {/* Config Diagnostics — local only */}
+      {!isRemote && (
+        <>
+          {state.doctor && (
+            <div>
+              <p className="text-sm text-muted-foreground mb-3">
+                Health score: {state.doctor.score}
+              </p>
+              <div className="space-y-2">
+                {state.doctor.issues.map((issue) => (
+                  <div
+                    key={issue.id}
+                    className="flex items-center gap-2 text-sm"
                   >
-                    fix
-                  </Button>
+                    {issue.severity === "error" && (
+                      <Badge variant="destructive">ERROR</Badge>
+                    )}
+                    {issue.severity === "warn" && (
+                      <Badge variant="secondary">WARN</Badge>
+                    )}
+                    {issue.severity === "info" && (
+                      <Badge variant="outline">INFO</Badge>
+                    )}
+                    <span>{issue.message}</span>
+                    {issue.autoFixable && (
+                      <Button
+                        size="sm"
+                        onClick={() => {
+                          api
+                            .fixIssues([issue.id])
+                            .then(() => runDoctorCmd())
+                            .then((report) =>
+                              dispatch({ type: "setDoctor", doctor: report }),
+                            )
+                            .catch(() =>
+                              dispatch({
+                                type: "setMessage",
+                                message: "Failed to fix issue",
+                              }),
+                            );
+                        }}
+                      >
+                        fix
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2 mt-3">
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    api
+                      .fixIssues(autoFixable)
+                      .then(() => runDoctorCmd())
+                      .then((report) =>
+                        dispatch({ type: "setDoctor", doctor: report }),
+                      )
+                      .catch(() =>
+                        dispatch({
+                          type: "setMessage",
+                          message: "Failed to fix all issues",
+                        }),
+                      );
+                  }}
+                  disabled={!autoFixable.length}
+                >
+                  Fix all auto issues
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={refreshing}
+                  onClick={() => {
+                    setRefreshing(true);
+                    runDoctorCmd()
+                      .then((report) => {
+                        dispatch({ type: "setDoctor", doctor: report });
+                        setLastRefreshed(new Date().toLocaleTimeString());
+                        refreshData();
+                      })
+                      .catch(() =>
+                        dispatch({
+                          type: "setMessage",
+                          message: "Refresh failed",
+                        }),
+                      )
+                      .finally(() => setRefreshing(false));
+                  }}
+                >
+                  {refreshing ? "Refreshing..." : "Refresh"}
+                </Button>
+                {lastRefreshed && (
+                  <span className="text-xs text-muted-foreground ml-2">
+                    Last refreshed: {lastRefreshed}
+                  </span>
                 )}
               </div>
-            ))}
-          </div>
-          <div className="flex gap-2 mt-3">
+            </div>
+          )}
+          {!hasReport ? (
             <Button
-              variant="outline"
-              onClick={() => {
-                api
-                  .fixIssues(autoFixable)
-                  .then(() => api.runDoctor())
+              onClick={() =>
+                runDoctorCmd()
                   .then((report) =>
                     dispatch({ type: "setDoctor", doctor: report }),
                   )
-                  .catch(() =>
-                    dispatch({
-                      type: "setMessage",
-                      message: "Failed to fix all issues",
-                    }),
-                  );
-              }}
-              disabled={!autoFixable.length}
+              }
             >
-              Fix all auto issues
+              Run Doctor
             </Button>
-            <Button
-              variant="outline"
-              disabled={refreshing}
-              onClick={() => {
-                setRefreshing(true);
-                api
-                  .runDoctor()
-                  .then((report) => {
-                    dispatch({ type: "setDoctor", doctor: report });
-                    setLastRefreshed(new Date().toLocaleTimeString());
-                    refreshData();
-                  })
-                  .catch(() =>
-                    dispatch({
-                      type: "setMessage",
-                      message: "Refresh failed",
-                    }),
-                  )
-                  .finally(() => setRefreshing(false));
-              }}
-            >
-              {refreshing ? "Refreshing..." : "Refresh"}
-            </Button>
-            {lastRefreshed && (
-              <span className="text-xs text-muted-foreground ml-2">
-                Last refreshed: {lastRefreshed}
-              </span>
-            )}
-          </div>
-        </div>
+          ) : null}
+          <p className="text-sm text-muted-foreground mt-2">{state.message}</p>
+        </>
       )}
-      {!hasReport ? (
-        <Button
-          onClick={() =>
-            api
-              .runDoctor()
-              .then((report) =>
-                dispatch({ type: "setDoctor", doctor: report }),
-              )
-          }
-        >
-          Run Doctor
-        </Button>
-      ) : null}
-      <p className="text-sm text-muted-foreground mt-2">{state.message}</p>
 
       {/* Data Cleanup */}
       <h3 className="text-lg font-semibold mt-6 mb-3">
@@ -273,7 +301,10 @@ export function Doctor() {
                   disabled={analyzing}
                   onClick={() => {
                     setAnalyzing(true);
-                    api.analyzeSessions()
+                    const analyzePromise = isRemote
+                      ? api.remoteAnalyzeSessions(instanceId)
+                      : api.analyzeSessions();
+                    analyzePromise
                       .then((data) => {
                         setSessionAnalysis(data);
                         setExpandedAgents(new Set());
@@ -303,7 +334,10 @@ export function Doctor() {
                       <AlertDialogAction
                         className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                         onClick={() => {
-                          api.clearAllSessions()
+                          const clearPromise = isRemote
+                            ? api.remoteClearAllSessions(instanceId)
+                            : api.clearAllSessions();
+                          clearPromise
                             .then((count) => {
                               setDataMessage(`Cleared ${count} session file(s)`);
                               setSessionAnalysis(null);
@@ -337,9 +371,19 @@ export function Doctor() {
             ) : (
               /* Analysis results: two-level view */
               <div className="space-y-3">
+                {sessionAnalysis.length === 0 && (
+                  <p className="text-sm text-muted-foreground">No session files found.</p>
+                )}
                 {sessionAnalysis.map((agentData) => {
                   const isExpanded = expandedAgents.has(agentData.agent);
                   const agentSelected = selectedSessions.get(agentData.agent) || new Set<string>();
+
+                  const deleteSessionsFn = (ids: string[]) => {
+                    const deletePromise = isRemote
+                      ? api.remoteDeleteSessionsByIds(instanceId, agentData.agent, ids)
+                      : api.deleteSessionsByIds(agentData.agent, ids);
+                    return deletePromise;
+                  };
 
                   return (
                     <div key={agentData.agent} className="border rounded-md p-3">
@@ -418,7 +462,7 @@ export function Doctor() {
                                     const ids = agentData.sessions
                                       .filter((s) => s.category === "empty")
                                       .map((s) => s.sessionId);
-                                    api.deleteSessionsByIds(agentData.agent, ids)
+                                    deleteSessionsFn(ids)
                                       .then((count) => {
                                         setDataMessage(`Deleted ${count} empty session(s) for ${agentData.agent}`);
                                         removeSessionsFromAnalysis(agentData.agent, new Set(ids));
@@ -463,7 +507,7 @@ export function Doctor() {
                                     const ids = agentData.sessions
                                       .filter((s) => s.category === "low_value")
                                       .map((s) => s.sessionId);
-                                    api.deleteSessionsByIds(agentData.agent, ids)
+                                    deleteSessionsFn(ids)
                                       .then((count) => {
                                         setDataMessage(`Deleted ${count} low-value session(s) for ${agentData.agent}`);
                                         removeSessionsFromAnalysis(agentData.agent, new Set(ids));
@@ -499,7 +543,7 @@ export function Doctor() {
                                     className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                                     onClick={() => {
                                       const ids = Array.from(agentSelected);
-                                      api.deleteSessionsByIds(agentData.agent, ids)
+                                      deleteSessionsFn(ids)
                                         .then((count) => {
                                           setDataMessage(`Deleted ${count} session(s) for ${agentData.agent}`);
                                           removeSessionsFromAnalysis(agentData.agent, new Set(ids));
@@ -587,7 +631,10 @@ export function Doctor() {
                                     setPreviewMessages([]);
                                     setPreviewLoading(true);
                                     setPreviewOpen(true);
-                                    api.previewSession(agentData.agent, session.sessionId)
+                                    const previewPromise = isRemote
+                                      ? api.remotePreviewSession(instanceId, agentData.agent, session.sessionId)
+                                      : api.previewSession(agentData.agent, session.sessionId);
+                                    previewPromise
                                       .then(setPreviewMessages)
                                       .catch(() => setPreviewMessages([{ role: "error", content: "Failed to load session" }]))
                                       .finally(() => setPreviewLoading(false));
@@ -618,7 +665,9 @@ export function Doctor() {
         </Card>
       </div>
 
-      {/* Backups */}
+      {/* Backups — local only */}
+      {!isRemote && (
+      <>
       <h3 className="text-lg font-semibold mt-6 mb-3">Backups</h3>
       {backups.length === 0 ? (
         <p className="text-muted-foreground text-sm">No backups available.</p>
@@ -704,6 +753,8 @@ export function Doctor() {
             </Card>
           ))}
         </div>
+      )}
+      </>
       )}
       {/* Session Preview Dialog */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>

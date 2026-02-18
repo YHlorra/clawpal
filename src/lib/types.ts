@@ -249,7 +249,7 @@ export interface SshHost {
   host: string;
   port: number;
   username: string;
-  authMethod: "key" | "ssh_config";
+  authMethod: "key" | "ssh_config" | "password";
   keyPath?: string;
 }
 

@@ -14,18 +14,20 @@ use tokio::sync::Mutex;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SshHostConfig {
     pub id: String,
     pub label: String,
     pub host: String,
     pub port: u16,
     pub username: String,
-    /// "key" | "ssh_config"
+    /// "key" | "ssh_config" | "password"
     pub auth_method: String,
     pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SshExecResult {
     pub stdout: String,
     pub stderr: String,
@@ -33,6 +35,7 @@ pub struct SshExecResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SftpEntry {
     pub name: String,
     pub is_dir: bool,
@@ -62,9 +65,10 @@ impl client::Handler for SshHandler {
 // Connection wrapper
 // ---------------------------------------------------------------------------
 
-/// Holds a live SSH session handle.
+/// Holds a live SSH session handle plus resolved remote home directory.
 struct SshConnection {
     handle: client::Handle<SshHandler>,
+    home_dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +92,22 @@ impl SshConnectionPool {
     /// Establish an SSH connection for the given host config and store it in
     /// the pool under `config.id`.
     pub async fn connect(&self, config: &SshHostConfig) -> Result<(), String> {
+        // Resolve connection params from ~/.ssh/config when using ssh_config mode
+        let ssh_entry = if config.auth_method == "ssh_config" {
+            parse_ssh_config(&config.host)
+        } else {
+            None
+        };
+
+        let connect_host = ssh_entry
+            .as_ref()
+            .and_then(|e| e.hostname.as_deref())
+            .unwrap_or(&config.host);
+        let connect_port = ssh_entry
+            .as_ref()
+            .and_then(|e| e.port)
+            .unwrap_or(config.port);
+
         let ssh_config = Arc::new(client::Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(300)),
             keepalive_interval: Some(std::time::Duration::from_secs(30)),
@@ -95,12 +115,27 @@ impl SshConnectionPool {
             ..<_>::default()
         });
 
-        let addr = (config.host.as_str(), config.port);
+        let addr = (connect_host, connect_port);
         let handler = SshHandler;
 
         let mut session = client::connect(ssh_config, addr, handler)
             .await
             .map_err(|e| format!("SSH connect failed: {e}"))?;
+
+        // Resolve username: UI value > ssh config value > system user
+        let username = if !config.username.is_empty() {
+            config.username.clone()
+        } else if let Some(ref entry) = ssh_entry {
+            entry.user.clone().unwrap_or_else(|| {
+                std::env::var("USER")
+                    .or_else(|_| std::env::var("USERNAME"))
+                    .unwrap_or_else(|_| "root".to_string())
+            })
+        } else {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "root".to_string())
+        };
 
         // Authenticate
         let authenticated = match config.auth_method.as_str() {
@@ -113,13 +148,39 @@ impl SshConnectionPool {
                 let key_pair = russh::keys::load_secret_key(&expanded, None)
                     .map_err(|e| format!("Failed to load SSH key {expanded}: {e}"))?;
                 session
-                    .authenticate_publickey(&config.username, Arc::new(key_pair))
+                    .authenticate_publickey(&username, Arc::new(key_pair))
                     .await
                     .map_err(|e| format!("Public key auth failed: {e}"))?
             }
             "ssh_config" => {
-                // Use ssh-agent for authentication
-                self.authenticate_with_agent(&mut session, &config.username).await?
+                // Try IdentityFile from ~/.ssh/config first, then fall back to agent
+                let identity_file = parse_ssh_config_identity(&config.host);
+                if let Some(key_path) = identity_file {
+                    let expanded = shellexpand::tilde(&key_path).to_string();
+                    match russh::keys::load_secret_key(&expanded, None) {
+                        Ok(key_pair) => {
+                            session
+                                .authenticate_publickey(&username, Arc::new(key_pair))
+                                .await
+                                .map_err(|e| format!("Public key auth failed: {e}"))?
+                        }
+                        Err(_) => {
+                            // Key file failed to load, try agent as fallback
+                            self.authenticate_with_agent(&mut session, &username).await?
+                        }
+                    }
+                } else {
+                    // No IdentityFile in config, try agent
+                    self.authenticate_with_agent(&mut session, &username).await?
+                }
+            }
+            "password" => {
+                // Password auth — password stored in key_path field for now
+                let password = config.key_path.as_deref().unwrap_or("");
+                session
+                    .authenticate_password(&username, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {e}"))?
             }
             other => return Err(format!("Unknown auth_method: {other}")),
         };
@@ -128,10 +189,13 @@ impl SshConnectionPool {
             return Err("SSH authentication failed (rejected by server)".into());
         }
 
+        // Resolve remote $HOME so we can build absolute SFTP paths
+        let home_dir = self.resolve_home(&session).await.unwrap_or_else(|_| "/root".to_string());
+
         let mut pool = self.connections.lock().await;
         pool.insert(
             config.id.clone(),
-            SshConnection { handle: session },
+            SshConnection { handle: session, home_dir },
         );
         Ok(())
     }
@@ -172,6 +236,38 @@ impl SshConnectionPool {
         }
 
         Ok(false)
+    }
+
+    // -- resolve_home -----------------------------------------------------
+
+    /// Run `echo $HOME` over a fresh channel to discover the remote home dir.
+    async fn resolve_home(&self, handle: &client::Handle<SshHandler>) -> Result<String, String> {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to open channel for home resolve: {e}"))?;
+        channel.exec(true, "echo $HOME").await.map_err(|e| format!("exec echo $HOME: {e}"))?;
+
+        let mut stdout = Vec::new();
+        loop {
+            let Some(msg) = channel.wait().await else { break };
+            if let ChannelMsg::Data { ref data } = msg {
+                stdout.extend_from_slice(data);
+            }
+        }
+        let home = String::from_utf8_lossy(&stdout).trim().to_string();
+        if home.is_empty() {
+            Err("Could not resolve remote $HOME".into())
+        } else {
+            Ok(home)
+        }
+    }
+
+    /// Return the cached home directory for a connection.
+    pub async fn get_home_dir(&self, id: &str) -> Result<String, String> {
+        let pool = self.connections.lock().await;
+        let conn = pool.get(id).ok_or_else(|| format!("No connection for id: {id}"))?;
+        Ok(conn.home_dir.clone())
     }
 
     // -- disconnect -------------------------------------------------------
@@ -253,6 +349,24 @@ impl SshConnectionPool {
         })
     }
 
+    /// Execute a command with login shell setup (sources profile for PATH).
+    pub async fn exec_login(&self, id: &str, command: &str) -> Result<SshExecResult, String> {
+        let wrapped = format!(
+            ". \"$HOME/.profile\" 2>/dev/null; . \"$HOME/.bashrc\" 2>/dev/null; . \"$HOME/.zshrc\" 2>/dev/null; {command}"
+        );
+        self.exec(id, &wrapped).await
+    }
+
+    /// Resolve a remote path, replacing leading `~/` with the cached home dir.
+    pub async fn resolve_path(&self, id: &str, path: &str) -> Result<String, String> {
+        if path.starts_with("~/") || path == "~" {
+            let home = self.get_home_dir(id).await?;
+            Ok(path.replacen('~', &home, 1))
+        } else {
+            Ok(path.to_string())
+        }
+    }
+
     // -- SFTP helpers (private) -------------------------------------------
 
     /// Open an SFTP session on the given connection. The caller is responsible
@@ -286,11 +400,12 @@ impl SshConnectionPool {
 
     /// Read a remote file and return its contents as a String.
     pub async fn sftp_read(&self, id: &str, path: &str) -> Result<String, String> {
+        let resolved = self.resolve_path(id, path).await?;
         let sftp = self.open_sftp(id).await?;
         let data = sftp
-            .read(path)
+            .read(&resolved)
             .await
-            .map_err(|e| format!("SFTP read failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP read failed for {resolved}: {e}"))?;
         let _ = sftp.close().await;
         String::from_utf8(data).map_err(|e| format!("File is not valid UTF-8: {e}"))
     }
@@ -299,22 +414,23 @@ impl SshConnectionPool {
 
     /// Write a String to a remote file (creates or truncates).
     pub async fn sftp_write(&self, id: &str, path: &str, content: &str) -> Result<(), String> {
+        let resolved = self.resolve_path(id, path).await?;
         let sftp = self.open_sftp(id).await?;
         let mut file = sftp
-            .create(path)
+            .create(&resolved)
             .await
-            .map_err(|e| format!("SFTP create failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP create failed for {resolved}: {e}"))?;
 
         use tokio::io::AsyncWriteExt;
         file.write_all(content.as_bytes())
             .await
-            .map_err(|e| format!("SFTP write failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP write failed for {resolved}: {e}"))?;
         file.flush()
             .await
-            .map_err(|e| format!("SFTP flush failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP flush failed for {resolved}: {e}"))?;
         file.shutdown()
             .await
-            .map_err(|e| format!("SFTP shutdown failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP shutdown failed for {resolved}: {e}"))?;
 
         let _ = sftp.close().await;
         Ok(())
@@ -324,11 +440,12 @@ impl SshConnectionPool {
 
     /// List the entries in a remote directory.
     pub async fn sftp_list(&self, id: &str, path: &str) -> Result<Vec<SftpEntry>, String> {
+        let resolved = self.resolve_path(id, path).await?;
         let sftp = self.open_sftp(id).await?;
         let read_dir = sftp
-            .read_dir(path)
+            .read_dir(&resolved)
             .await
-            .map_err(|e| format!("SFTP read_dir failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP read_dir failed for {resolved}: {e}"))?;
 
         let entries: Vec<SftpEntry> = read_dir
             .map(|entry| {
@@ -349,10 +466,11 @@ impl SshConnectionPool {
 
     /// Delete a remote file.
     pub async fn sftp_remove(&self, id: &str, path: &str) -> Result<(), String> {
+        let resolved = self.resolve_path(id, path).await?;
         let sftp = self.open_sftp(id).await?;
-        sftp.remove_file(path)
+        sftp.remove_file(&resolved)
             .await
-            .map_err(|e| format!("SFTP remove failed for {path}: {e}"))?;
+            .map_err(|e| format!("SFTP remove failed for {resolved}: {e}"))?;
         let _ = sftp.close().await;
         Ok(())
     }
@@ -362,4 +480,84 @@ impl Default for SshConnectionPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH config parser
+// ---------------------------------------------------------------------------
+
+/// Parsed fields from an SSH config Host block.
+struct SshConfigEntry {
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_file: Option<String>,
+}
+
+/// Parse `~/.ssh/config` and return the resolved entry for a given host alias.
+fn parse_ssh_config(host_alias: &str) -> Option<SshConfigEntry> {
+    let home = dirs::home_dir()?;
+    let config_path = home.join(".ssh").join("config");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+
+    let mut current_hosts: Vec<String> = Vec::new();
+    let mut entries: Vec<(Vec<String>, SshConfigEntry)> = Vec::new();
+    let mut entry = SshConfigEntry {
+        hostname: None,
+        user: None,
+        port: None,
+        identity_file: None,
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Split on first whitespace or '='
+        let (key, value) = match trimmed.split_once(|c: char| c.is_whitespace() || c == '=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+
+        if key.eq_ignore_ascii_case("Host") {
+            // Save previous block
+            if !current_hosts.is_empty() {
+                entries.push((current_hosts, entry));
+            }
+            current_hosts = value.split_whitespace().map(|s| s.to_string()).collect();
+            entry = SshConfigEntry {
+                hostname: None,
+                user: None,
+                port: None,
+                identity_file: None,
+            };
+        } else if key.eq_ignore_ascii_case("HostName") {
+            entry.hostname = Some(value.to_string());
+        } else if key.eq_ignore_ascii_case("User") {
+            entry.user = Some(value.to_string());
+        } else if key.eq_ignore_ascii_case("Port") {
+            entry.port = value.parse().ok();
+        } else if key.eq_ignore_ascii_case("IdentityFile") {
+            entry.identity_file = Some(value.to_string());
+        }
+    }
+    // Save last block
+    if !current_hosts.is_empty() {
+        entries.push((current_hosts, entry));
+    }
+
+    // Find matching entry (exact match, no glob support for now)
+    for (hosts, e) in entries {
+        if hosts.iter().any(|h| h == host_alias || h == "*") {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Convenience: extract just the IdentityFile for a host.
+fn parse_ssh_config_identity(host_alias: &str) -> Option<String> {
+    parse_ssh_config(host_alias).and_then(|e| e.identity_file)
 }

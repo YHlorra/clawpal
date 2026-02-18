@@ -5,7 +5,8 @@ import { resolveSteps, executeStep, type ResolvedStep } from "../lib/actions";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { DiscordGuildChannel, Recipe } from "../lib/types";
+import type { Recipe } from "../lib/types";
+import { useInstance } from "@/lib/instance-context";
 
 type Phase = "params" | "confirm" | "execute" | "done";
 type StepStatus = "pending" | "running" | "done" | "failed" | "skipped";
@@ -14,13 +15,12 @@ export function Cook({
   recipeId,
   onDone,
   recipeSource,
-  discordGuildChannels,
 }: {
   recipeId: string;
   onDone?: () => void;
   recipeSource?: string;
-  discordGuildChannels: DiscordGuildChannel[];
 }) {
+  const { instanceId, isRemote, discordGuildChannels } = useInstance();
   const [recipe, setRecipe] = useState<Recipe | null>(null);
   const [params, setParams] = useState<Record<string, string>>({});
   const [phase, setPhase] = useState<Phase>("params");
@@ -61,7 +61,7 @@ export function Cook({
       statuses[i] = "running";
       setStepStatuses([...statuses]);
       try {
-        await executeStep(resolvedStepList[i]);
+        await executeStep(resolvedStepList[i], { instanceId, isRemote });
         statuses[i] = "done";
       } catch (err) {
         statuses[i] = "failed";
@@ -145,7 +145,6 @@ export function Cook({
           onChange={(id, value) => setParams((prev) => ({ ...prev, [id]: value }))}
           onSubmit={handleNext}
           submitLabel="Next"
-          discordGuildChannels={discordGuildChannels}
         />
       )}
 

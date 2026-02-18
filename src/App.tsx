@@ -66,7 +66,8 @@ export function App() {
   const handleInstanceSelect = useCallback((id: string) => {
     setActiveInstance(id);
     if (id !== "local") {
-      setConnectionStatus((prev) => ({ ...prev, [id]: prev[id] || "disconnected" }));
+      // Always set to disconnected first, then attempt (re)connect
+      setConnectionStatus((prev) => ({ ...prev, [id]: "disconnected" }));
       api.sshConnect(id)
         .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })))
         .catch(() => setConnectionStatus((prev) => ({ ...prev, [id]: "error" })));
@@ -85,19 +86,35 @@ export function App() {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Establish baseline on startup
+  const isRemote = activeInstance !== "local";
+  const isConnected = !isRemote || connectionStatus[activeInstance] === "connected";
+
+  // Establish baseline on startup or instance change
   useEffect(() => {
-    api.saveConfigBaseline().catch((e) => console.error("Failed to save config baseline:", e));
-  }, []);
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteSaveConfigBaseline(activeInstance).catch((e) => console.error("Failed to save remote config baseline:", e));
+    } else {
+      api.saveConfigBaseline().catch((e) => console.error("Failed to save config baseline:", e));
+    }
+  }, [activeInstance, isRemote, isConnected]);
 
   // Poll for dirty state
   const checkDirty = useCallback(() => {
-    api.checkConfigDirty()
-      .then((state) => setDirty(state.dirty))
-      .catch((e) => console.error("Failed to check config dirty state:", e));
-  }, []);
+    if (isRemote) {
+      if (!isConnected) return;
+      api.remoteCheckConfigDirty(activeInstance)
+        .then((state) => setDirty(state.dirty))
+        .catch((e) => console.error("Failed to check remote config dirty state:", e));
+    } else {
+      api.checkConfigDirty()
+        .then((state) => setDirty(state.dirty))
+        .catch((e) => console.error("Failed to check config dirty state:", e));
+    }
+  }, [isRemote, isConnected, activeInstance]);
 
   useEffect(() => {
+    setDirty(false); // Reset dirty on instance change
     checkDirty();
     pollRef.current = setInterval(checkDirty, 2000);
     return () => {
@@ -105,15 +122,19 @@ export function App() {
     };
   }, [checkDirty]);
 
-  // Load Discord data from cache on startup (instant, no subprocess)
+  // Load Discord data + extract profiles on startup or instance change
   useEffect(() => {
-    if (!localStorage.getItem("clawpal_profiles_extracted")) {
-      api.extractModelProfilesFromConfig()
-        .then(() => localStorage.setItem("clawpal_profiles_extracted", "1"))
-        .catch((e) => console.error("Failed to extract model profiles:", e));
+    if (activeInstance === "local") {
+      if (!localStorage.getItem("clawpal_profiles_extracted")) {
+        api.extractModelProfilesFromConfig()
+          .then(() => localStorage.setItem("clawpal_profiles_extracted", "1"))
+          .catch((e) => console.error("Failed to extract model profiles:", e));
+      }
+      api.listDiscordGuildChannels().then(setDiscordGuildChannels).catch((e) => console.error("Failed to load Discord channels:", e));
+    } else if (connectionStatus[activeInstance] === "connected") {
+      api.remoteListDiscordGuildChannels(activeInstance).then(setDiscordGuildChannels).catch((e) => console.error("Failed to load remote Discord channels:", e));
     }
-    api.listDiscordGuildChannels().then(setDiscordGuildChannels).catch((e) => console.error("Failed to load Discord channels:", e));
-  }, []);
+  }, [activeInstance, connectionStatus]);
 
   const bumpConfigVersion = useCallback(() => {
     setConfigVersion((v) => v + 1);
@@ -121,7 +142,10 @@ export function App() {
 
   const handleApplyClick = () => {
     // Load diff data for the dialog
-    api.checkConfigDirty()
+    const checkPromise = isRemote
+      ? api.remoteCheckConfigDirty(activeInstance)
+      : api.checkConfigDirty();
+    checkPromise
       .then((state) => {
         setApplyDiffBaseline(state.baseline);
         setApplyDiffCurrent(state.current);
@@ -146,7 +170,10 @@ export function App() {
   const handleApplyConfirm = () => {
     setApplying(true);
     setApplyError("");
-    api.applyPendingChanges()
+    const applyPromise = isRemote
+      ? api.remoteApplyPendingChanges(activeInstance)
+      : api.applyPendingChanges();
+    applyPromise
       .then(() => {
         setShowApplyDialog(false);
         setDirty(false);
@@ -158,7 +185,10 @@ export function App() {
   };
 
   const handleDiscardConfirm = () => {
-    api.discardConfigChanges()
+    const discardPromise = isRemote
+      ? api.remoteDiscardConfigChanges(activeInstance)
+      : api.discardConfigChanges();
+    discardPromise
       .then(() => {
         setShowDiscardDialog(false);
         setDirty(false);
@@ -268,7 +298,7 @@ export function App() {
           </div>
         )}
       </aside>
-      <InstanceContext.Provider value={{ instanceId: activeInstance, isRemote: activeInstance !== "local" }}>
+      <InstanceContext.Provider value={{ instanceId: activeInstance, isRemote, isConnected, discordGuildChannels }}>
       <main className="flex-1 overflow-y-auto p-4 relative">
         {/* Chat toggle -- top-right corner */}
         {!chatOpen && (
@@ -284,7 +314,7 @@ export function App() {
 
         {route === "home" && (
           <Home
-            key={configVersion}
+            key={`${activeInstance}-${configVersion}`}
             onCook={(id, source) => {
               setRecipeId(id);
               setRecipeSource(source);
@@ -306,7 +336,6 @@ export function App() {
           <Cook
             recipeId={recipeId}
             recipeSource={recipeSource}
-            discordGuildChannels={discordGuildChannels}
             onDone={() => {
               setRoute("recipes");
             }}
@@ -315,14 +344,14 @@ export function App() {
         {route === "cook" && !recipeId && <p>No recipe selected.</p>}
         {route === "channels" && (
           <Channels
-            key={configVersion}
+            key={`${activeInstance}-${configVersion}`}
             showToast={showToast}
           />
         )}
-        {route === "history" && <History key={configVersion} />}
+        {route === "history" && <History key={`${activeInstance}-${configVersion}`} />}
         {route === "doctor" && <Doctor />}
         {route === "settings" && (
-          <Settings key={configVersion} onDataChange={bumpConfigVersion} />
+          <Settings key={`${activeInstance}-${configVersion}`} onDataChange={bumpConfigVersion} />
         )}
       </main>
       </InstanceContext.Provider>

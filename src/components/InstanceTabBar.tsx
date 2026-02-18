@@ -159,10 +159,10 @@ export function InstanceTabBar({
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 w-7 p-0 shrink-0"
+          className="h-7 px-2 shrink-0 text-xs"
           onClick={openAddDialog}
         >
-          +
+          + SSH
         </Button>
       </div>
 
@@ -210,7 +210,7 @@ export function InstanceTabBar({
                 id="ssh-username"
                 value={form.username}
                 onChange={(e) => setForm((f) => ({ ...f, username: e.target.value }))}
-                placeholder="root"
+                placeholder="(optional, defaults to current user)"
               />
             </div>
             <div className="space-y-1.5">
@@ -220,8 +220,8 @@ export function InstanceTabBar({
                 onValueChange={(val) =>
                   setForm((f) => ({
                     ...f,
-                    authMethod: val as "key" | "ssh_config",
-                    keyPath: val === "ssh_config" ? undefined : f.keyPath,
+                    authMethod: val as SshHost["authMethod"],
+                    keyPath: val === "ssh_config" ? undefined : (val !== f.authMethod ? "" : f.keyPath),
                   }))
                 }
               >
@@ -231,6 +231,7 @@ export function InstanceTabBar({
                 <SelectContent>
                   <SelectItem value="ssh_config">SSH Config / Agent</SelectItem>
                   <SelectItem value="key">Private Key</SelectItem>
+                  <SelectItem value="password">Password</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -245,12 +246,23 @@ export function InstanceTabBar({
                 />
               </div>
             )}
+            {form.authMethod === "password" && (
+              <div className="space-y-1.5">
+                <Label htmlFor="ssh-password">Password</Label>
+                <Input
+                  id="ssh-password"
+                  type="password"
+                  value={form.keyPath || ""}
+                  onChange={(e) => setForm((f) => ({ ...f, keyPath: e.target.value }))}
+                />
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={saving || !form.host || !form.username}>
+            <Button onClick={handleSave} disabled={saving || !form.host}>
               {saving ? "Saving..." : editingHost ? "Update" : "Add"}
             </Button>
           </DialogFooter>

@@ -140,4 +140,64 @@ export const api = {
     invoke("remote_read_raw_config", { hostId }),
   remoteGetSystemStatus: (hostId: string): Promise<Record<string, unknown>> =>
     invoke("remote_get_system_status", { hostId }),
+  remoteListAgentsOverview: (hostId: string): Promise<AgentOverview[]> =>
+    invoke("remote_list_agents_overview", { hostId }),
+  remoteListChannelsMinimal: (hostId: string): Promise<ChannelNode[]> =>
+    invoke("remote_list_channels_minimal", { hostId }),
+  remoteListBindings: (hostId: string): Promise<Record<string, unknown>[]> =>
+    invoke("remote_list_bindings", { hostId }),
+  remoteRestartGateway: (hostId: string): Promise<boolean> =>
+    invoke("remote_restart_gateway", { hostId }),
+  remoteApplyConfigPatch: (hostId: string, patchTemplate: string, params: Record<string, string>): Promise<ApplyResult> =>
+    invoke("remote_apply_config_patch", { hostId, patchTemplate, params }),
+  remoteCreateAgent: (hostId: string, agentId: string, model?: string): Promise<AgentOverview> =>
+    invoke("remote_create_agent", { hostId, agentId, model }),
+  remoteDeleteAgent: (hostId: string, agentId: string): Promise<boolean> =>
+    invoke("remote_delete_agent", { hostId, agentId }),
+  remoteAssignChannelAgent: (hostId: string, channelType: string, peerId: string, agentId: string | null): Promise<boolean> =>
+    invoke("remote_assign_channel_agent", { hostId, channelType, peerId, agentId }),
+  remoteSetGlobalModel: (hostId: string, modelValue: string | null): Promise<boolean> =>
+    invoke("remote_set_global_model", { hostId, modelValue }),
+  remoteListDiscordGuildChannels: (hostId: string): Promise<DiscordGuildChannel[]> =>
+    invoke("remote_list_discord_guild_channels", { hostId }),
+  remoteRunDoctor: (hostId: string): Promise<DoctorReport> =>
+    invoke("remote_run_doctor", { hostId }),
+  remoteListHistory: (hostId: string): Promise<{ items: HistoryItem[] }> =>
+    invoke("remote_list_history", { hostId }),
+  remoteWriteRawConfig: (hostId: string, content: string): Promise<boolean> =>
+    invoke("remote_write_raw_config", { hostId, content }),
+  remoteAnalyzeSessions: (hostId: string): Promise<AgentSessionAnalysis[]> =>
+    invoke("remote_analyze_sessions", { hostId }),
+  remoteDeleteSessionsByIds: (hostId: string, agentId: string, sessionIds: string[]): Promise<number> =>
+    invoke("remote_delete_sessions_by_ids", { hostId, agentId, sessionIds }),
+  remoteListSessionFiles: (hostId: string): Promise<SessionFile[]> =>
+    invoke("remote_list_session_files", { hostId }),
+  remoteClearAllSessions: (hostId: string): Promise<number> =>
+    invoke("remote_clear_all_sessions", { hostId }),
+  remotePreviewSession: (hostId: string, agentId: string, sessionId: string): Promise<{ role: string; content: string }[]> =>
+    invoke("remote_preview_session", { hostId, agentId, sessionId }),
+  remoteListModelProfiles: (hostId: string): Promise<ModelProfile[]> =>
+    invoke("remote_list_model_profiles", { hostId }),
+  remoteUpsertModelProfile: (hostId: string, profile: ModelProfile): Promise<ModelProfile> =>
+    invoke("remote_upsert_model_profile", { hostId, profile }),
+  remoteDeleteModelProfile: (hostId: string, profileId: string): Promise<boolean> =>
+    invoke("remote_delete_model_profile", { hostId, profileId }),
+  remoteResolveApiKeys: (hostId: string): Promise<ResolvedApiKey[]> =>
+    invoke("remote_resolve_api_keys", { hostId }),
+  remoteExtractModelProfilesFromConfig: (hostId: string): Promise<{ created: number; reused: number; skippedInvalid: number }> =>
+    invoke("remote_extract_model_profiles_from_config", { hostId }),
+  remoteRefreshModelCatalog: (hostId: string): Promise<ModelCatalogProvider[]> =>
+    invoke("remote_refresh_model_catalog", { hostId }),
+  remoteChatViaOpenclaw: (hostId: string, agentId: string, message: string, sessionId?: string): Promise<Record<string, unknown>> =>
+    invoke("remote_chat_via_openclaw", { hostId, agentId, message, sessionId }),
+  remoteCheckOpeclawUpdate: (hostId: string): Promise<{ upgradeAvailable: boolean; latestVersion: string | null; installedVersion: string }> =>
+    invoke("remote_check_openclaw_update", { hostId }),
+  remoteSaveConfigBaseline: (hostId: string): Promise<boolean> =>
+    invoke("remote_save_config_baseline", { hostId }),
+  remoteCheckConfigDirty: (hostId: string): Promise<ConfigDirtyState> =>
+    invoke("remote_check_config_dirty", { hostId }),
+  remoteDiscardConfigChanges: (hostId: string): Promise<boolean> =>
+    invoke("remote_discard_config_changes", { hostId }),
+  remoteApplyPendingChanges: (hostId: string): Promise<boolean> =>
+    invoke("remote_apply_pending_changes", { hostId }),
 };
