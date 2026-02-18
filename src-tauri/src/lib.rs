@@ -24,6 +24,7 @@ pub mod doctor;
 pub mod history;
 pub mod models;
 pub mod recipe;
+pub mod ssh;
 
 pub fn run() {
     tauri::Builder::default()
