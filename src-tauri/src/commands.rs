@@ -5,10 +5,13 @@ use std::{fs, process::Command, time::{SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use tauri::State;
+
 use crate::config_io::{ensure_dirs, read_openclaw_config, write_json, write_text};
 use crate::doctor::{apply_auto_fixes, run_doctor, DoctorReport};
 use crate::history::{add_snapshot, list_snapshots, read_snapshot};
 use crate::models::resolve_paths;
+use crate::ssh::{SshConnectionPool, SshHostConfig, SshExecResult, SftpEntry};
 use crate::recipe::{
     load_recipes_with_fallback,
     collect_change_paths,
@@ -3922,4 +3925,173 @@ fn resolve_model_provider_base_url(cfg: &Value, provider: &str) -> Option<String
                         .map(str::to_string)
                 })
         })
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: Remote instance config CRUD
+// ---------------------------------------------------------------------------
+
+fn remote_instances_path() -> PathBuf {
+    resolve_paths().clawpal_dir.join("remote-instances.json")
+}
+
+fn read_hosts_from_disk() -> Result<Vec<SshHostConfig>, String> {
+    let path = remote_instances_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(&path).map_err(|e| format!("Failed to read remote-instances.json: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("Failed to parse remote-instances.json: {e}"))
+}
+
+fn write_hosts_to_disk(hosts: &[SshHostConfig]) -> Result<(), String> {
+    let path = remote_instances_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(hosts).map_err(|e| format!("Failed to serialize hosts: {e}"))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write remote-instances.json: {e}"))
+}
+
+#[tauri::command]
+pub fn list_ssh_hosts() -> Result<Vec<SshHostConfig>, String> {
+    read_hosts_from_disk()
+}
+
+#[tauri::command]
+pub fn upsert_ssh_host(host: SshHostConfig) -> Result<SshHostConfig, String> {
+    let mut hosts = read_hosts_from_disk()?;
+    if let Some(existing) = hosts.iter_mut().find(|h| h.id == host.id) {
+        *existing = host.clone();
+    } else {
+        hosts.push(host.clone());
+    }
+    write_hosts_to_disk(&hosts)?;
+    Ok(host)
+}
+
+#[tauri::command]
+pub fn delete_ssh_host(host_id: String) -> Result<bool, String> {
+    let mut hosts = read_hosts_from_disk()?;
+    let before = hosts.len();
+    hosts.retain(|h| h.id != host_id);
+    let removed = hosts.len() < before;
+    write_hosts_to_disk(&hosts)?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: SSH connect / disconnect / status
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn ssh_connect(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    let hosts = read_hosts_from_disk()?;
+    let host = hosts.into_iter().find(|h| h.id == host_id)
+        .ok_or_else(|| format!("No SSH host config with id: {host_id}"))?;
+    pool.connect(&host).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn ssh_disconnect(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    pool.disconnect(&host_id).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn ssh_status(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<String, String> {
+    if pool.is_connected(&host_id).await {
+        Ok("connected".to_string())
+    } else {
+        Ok("disconnected".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: SSH exec and SFTP Tauri commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn ssh_exec(pool: State<'_, SshConnectionPool>, host_id: String, command: String) -> Result<SshExecResult, String> {
+    pool.exec(&host_id, &command).await
+}
+
+#[tauri::command]
+pub async fn sftp_read_file(pool: State<'_, SshConnectionPool>, host_id: String, path: String) -> Result<String, String> {
+    pool.sftp_read(&host_id, &path).await
+}
+
+#[tauri::command]
+pub async fn sftp_write_file(pool: State<'_, SshConnectionPool>, host_id: String, path: String, content: String) -> Result<bool, String> {
+    pool.sftp_write(&host_id, &path, &content).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn sftp_list_dir(pool: State<'_, SshConnectionPool>, host_id: String, path: String) -> Result<Vec<SftpEntry>, String> {
+    pool.sftp_list(&host_id, &path).await
+}
+
+#[tauri::command]
+pub async fn sftp_remove_file(pool: State<'_, SshConnectionPool>, host_id: String, path: String) -> Result<bool, String> {
+    pool.sftp_remove(&host_id, &path).await?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: Remote business commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn remote_read_raw_config(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Value, String> {
+    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
+    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))
+}
+
+#[tauri::command]
+pub async fn remote_get_system_status(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Value, String> {
+    // 1. Get openclaw version
+    let version_result = pool.exec(&host_id, "openclaw --version").await?;
+    let openclaw_version = version_result.stdout.trim().to_string();
+
+    // 2. Read remote config
+    let config_raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await;
+    let (active_agents, global_default_model, gateway_port) = match &config_raw {
+        Ok(raw) => {
+            let cfg: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+            let agents = cfg.pointer("/agents")
+                .and_then(Value::as_object)
+                .map(|a| a.len() as u32)
+                .unwrap_or(0);
+            let model = cfg.pointer("/models/default")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let port = cfg.pointer("/gateway/port")
+                .and_then(Value::as_u64)
+                .unwrap_or(5337);
+            (agents, model, port)
+        }
+        Err(_) => (0, String::new(), 5337),
+    };
+
+    // 3. Check gateway health
+    let health_cmd = format!("curl -sf http://localhost:{gateway_port}/health");
+    let health_result = pool.exec(&host_id, &health_cmd).await;
+    let healthy = match health_result {
+        Ok(r) => r.exit_code == 0,
+        Err(_) => false,
+    };
+
+    let status = serde_json::json!({
+        "healthy": healthy,
+        "openclawVersion": openclaw_version,
+        "activeAgents": active_agents,
+        "globalDefaultModel": global_default_model,
+        "configPath": "~/.openclaw/openclaw.json",
+        "openclawDir": "~/.openclaw",
+    });
+
+    Ok(status)
 }

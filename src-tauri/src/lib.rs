@@ -16,7 +16,12 @@ use crate::commands::{
     list_bindings,
     assign_channel_agent,
     save_config_baseline, check_config_dirty, discard_config_changes, apply_pending_changes,
+    list_ssh_hosts, upsert_ssh_host, delete_ssh_host,
+    ssh_connect, ssh_disconnect, ssh_status,
+    ssh_exec, sftp_read_file, sftp_write_file, sftp_list_dir, sftp_remove_file,
+    remote_read_raw_config, remote_get_system_status,
 };
+use crate::ssh::SshConnectionPool;
 
 pub mod commands;
 pub mod config_io;
@@ -28,6 +33,7 @@ pub mod ssh;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(SshConnectionPool::new())
         .invoke_handler(tauri::generate_handler![
             get_system_status,
             get_status_light,
@@ -82,6 +88,19 @@ pub fn run() {
             check_config_dirty,
             discard_config_changes,
             apply_pending_changes,
+            list_ssh_hosts,
+            upsert_ssh_host,
+            delete_ssh_host,
+            ssh_connect,
+            ssh_disconnect,
+            ssh_status,
+            ssh_exec,
+            sftp_read_file,
+            sftp_write_file,
+            sftp_list_dir,
+            sftp_remove_file,
+            remote_read_raw_config,
+            remote_get_system_status,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run app");
