@@ -26,6 +26,7 @@ import { RecipeCard } from "@/components/RecipeCard";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { StatusLight, AgentOverview, Recipe, BackupInfo, ModelProfile } from "../lib/types";
 import { formatTime, formatBytes } from "@/lib/utils";
+import { useInstance } from "@/lib/instance-context";
 
 interface AgentGroup {
   identity: string;
@@ -57,6 +58,7 @@ export function Home({
   onCook?: (recipeId: string, source?: string) => void;
   showToast?: (message: string, type?: "success" | "error") => void;
 }) {
+  const { instanceId, isRemote } = useInstance();
   const [status, setStatus] = useState<StatusLight | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<{ available: boolean; latest?: string } | null>(null);
@@ -76,18 +78,29 @@ export function Home({
   const retriesRef = useRef(0);
 
   const fetchStatus = useCallback(() => {
-    api.getStatusLight().then((s) => {
-      setStatus(s);
-      if (s.healthy) {
+    if (isRemote) {
+      api.remoteGetSystemStatus(instanceId).then((s) => {
+        const healthy = s.healthy as boolean ?? false;
+        const activeAgents = s.activeAgents as number ?? 0;
+        const globalDefaultModel = s.globalDefaultModel as string | undefined;
+        setStatus({ healthy, activeAgents, globalDefaultModel });
         setStatusSettled(true);
-        retriesRef.current = 0;
-      } else if (retriesRef.current < 5) {
-        retriesRef.current++;
-      } else {
-        setStatusSettled(true);
-      }
-    }).catch((e) => console.error("Failed to fetch status:", e));
-  }, []);
+        if (s.openclawVersion) setVersion(s.openclawVersion as string);
+      }).catch((e) => console.error("Failed to fetch remote status:", e));
+    } else {
+      api.getStatusLight().then((s) => {
+        setStatus(s);
+        if (s.healthy) {
+          setStatusSettled(true);
+          retriesRef.current = 0;
+        } else if (retriesRef.current < 5) {
+          retriesRef.current++;
+        } else {
+          setStatusSettled(true);
+        }
+      }).catch((e) => console.error("Failed to fetch status:", e));
+    }
+  }, [isRemote, instanceId]);
 
   useEffect(() => {
     fetchStatus();
@@ -97,8 +110,13 @@ export function Home({
   }, [fetchStatus, statusSettled]);
 
   const refreshAgents = useCallback(() => {
+    if (isRemote) {
+      // Remote agents not yet fully supported; show empty list
+      setAgents([]);
+      return;
+    }
     api.listAgentsOverview().then(setAgents).catch((e) => console.error("Failed to load agents:", e));
-  }, []);
+  }, [isRemote]);
 
   useEffect(() => {
     refreshAgents();
@@ -108,17 +126,21 @@ export function Home({
   }, [refreshAgents]);
 
   useEffect(() => {
+    if (isRemote) { setRecipes([]); return; }
     api.listRecipes().then((r) => setRecipes(r.slice(0, 4))).catch((e) => console.error("Failed to load recipes:", e));
-  }, []);
+  }, [isRemote]);
 
   const refreshBackups = () => {
+    if (isRemote) { setBackups([]); return; }
     api.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
   };
-  useEffect(refreshBackups, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(refreshBackups, [isRemote]);
 
   useEffect(() => {
+    if (isRemote) { setModelProfiles([]); return; }
     api.listModelProfiles().then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch((e) => console.error("Failed to load model profiles:", e));
-  }, []);
+  }, [isRemote]);
 
   // Match current global model value to a profile ID
   const currentModelProfileId = useMemo(() => {
@@ -136,8 +158,9 @@ export function Home({
 
   const agentGroups = useMemo(() => groupAgents(agents || []), [agents]);
 
-  // Heavy call: version + update check, deferred
+  // Heavy call: version + update check, deferred (local only; remote version set in fetchStatus)
   useEffect(() => {
+    if (isRemote) return;
     const timer = setTimeout(() => {
       api.getSystemStatus().then((s) => {
         setVersion(s.openclawVersion);
@@ -150,7 +173,7 @@ export function Home({
       }).catch((e) => console.error("Failed to fetch system status:", e));
     }, 100);
     return () => clearTimeout(timer);
-  }, []);
+  }, [isRemote]);
 
   const handleDeleteAgent = (agentId: string) => {
     api.deleteAgent(agentId)
@@ -218,39 +241,43 @@ export function Home({
               )}
             </div>
 
-            <span className="text-sm text-muted-foreground">Default Model</span>
-            <div className="max-w-xs">
-              {status ? (
-                <Select
-                  value={currentModelProfileId || "__none__"}
-                  onValueChange={(val) => {
-                    setSavingModel(true);
-                    api.setGlobalModel(val === "__none__" ? null : val)
-                      .then(() => api.getStatusLight())
-                      .then(setStatus)
-                      .catch((e) => showToast?.(String(e), "error"))
-                      .finally(() => setSavingModel(false));
-                  }}
-                  disabled={savingModel}
-                >
-                  <SelectTrigger size="sm" className="text-sm">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">
-                      <span className="text-muted-foreground">not set</span>
-                    </SelectItem>
-                    {modelProfiles.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.provider}/{p.model}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              ) : (
-                <span className="text-sm">...</span>
-              )}
-            </div>
+            {!isRemote && (
+              <>
+                <span className="text-sm text-muted-foreground">Default Model</span>
+                <div className="max-w-xs">
+                  {status ? (
+                    <Select
+                      value={currentModelProfileId || "__none__"}
+                      onValueChange={(val) => {
+                        setSavingModel(true);
+                        api.setGlobalModel(val === "__none__" ? null : val)
+                          .then(() => api.getStatusLight())
+                          .then(setStatus)
+                          .catch((e) => showToast?.(String(e), "error"))
+                          .finally(() => setSavingModel(false));
+                      }}
+                      disabled={savingModel}
+                    >
+                      <SelectTrigger size="sm" className="text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">
+                          <span className="text-muted-foreground">not set</span>
+                        </SelectItem>
+                        {modelProfiles.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.provider}/{p.model}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <span className="text-sm">...</span>
+                  )}
+                </div>
+              </>
+            )}
           </CardContent>
         </Card>
 
@@ -332,136 +359,144 @@ export function Home({
         )}
 
         {/* Recommended Recipes */}
-        <h3 className="text-lg font-semibold mt-6 mb-3">Recommended Recipes</h3>
-        {recipes.length === 0 ? (
-          <p className="text-muted-foreground">No recipes available.</p>
-        ) : (
-          <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
-            {recipes.map((recipe) => (
-              <RecipeCard
-                key={recipe.id}
-                recipe={recipe}
-                onCook={() => onCook?.(recipe.id)}
-                compact
-              />
-            ))}
-          </div>
+        {!isRemote && (
+          <>
+            <h3 className="text-lg font-semibold mt-6 mb-3">Recommended Recipes</h3>
+            {recipes.length === 0 ? (
+              <p className="text-muted-foreground">No recipes available.</p>
+            ) : (
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
+                {recipes.map((recipe) => (
+                  <RecipeCard
+                    key={recipe.id}
+                    recipe={recipe}
+                    onCook={() => onCook?.(recipe.id)}
+                    compact
+                  />
+                ))}
+              </div>
+            )}
+          </>
         )}
 
         {/* Backups */}
-        <div className="flex items-center justify-between mt-6 mb-3">
-          <h3 className="text-lg font-semibold">Backups</h3>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={backingUp}
-            onClick={() => {
-              setBackingUp(true);
-              setBackupMessage("");
-              api.backupBeforeUpgrade()
-                .then((info) => {
-                  setBackupMessage(`Created backup: ${info.name}`);
-                  refreshBackups();
-                })
-                .catch((e) => setBackupMessage(`Backup failed: ${e}`))
-                .finally(() => setBackingUp(false));
-            }}
-          >
-            {backingUp ? "Creating..." : "Create Backup"}
-          </Button>
-        </div>
-        {backupMessage && (
-          <p className="text-sm text-muted-foreground mb-2">{backupMessage}</p>
-        )}
-        {backups === null ? (
-          <div className="space-y-2">
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </div>
-        ) : backups.length === 0 ? (
-          <p className="text-muted-foreground text-sm">No backups available.</p>
-        ) : (
-          <div className="space-y-2">
-            {backups.map((backup) => (
-              <Card key={backup.name}>
-                <CardContent className="flex items-center justify-between">
-                  <div>
-                    <div className="font-medium text-sm">{backup.name}</div>
-                    <div className="text-xs text-muted-foreground">
-                      {formatTime(backup.createdAt)} — {formatBytes(backup.sizeBytes)}
-                    </div>
-                  </div>
-                  <div className="flex gap-1.5">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => api.openUrl(backup.path)}
-                    >
-                      Show
-                    </Button>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button size="sm" variant="outline">
-                          Restore
+        {!isRemote && (
+          <>
+            <div className="flex items-center justify-between mt-6 mb-3">
+              <h3 className="text-lg font-semibold">Backups</h3>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={backingUp}
+                onClick={() => {
+                  setBackingUp(true);
+                  setBackupMessage("");
+                  api.backupBeforeUpgrade()
+                    .then((info) => {
+                      setBackupMessage(`Created backup: ${info.name}`);
+                      refreshBackups();
+                    })
+                    .catch((e) => setBackupMessage(`Backup failed: ${e}`))
+                    .finally(() => setBackingUp(false));
+                }}
+              >
+                {backingUp ? "Creating..." : "Create Backup"}
+              </Button>
+            </div>
+            {backupMessage && (
+              <p className="text-sm text-muted-foreground mb-2">{backupMessage}</p>
+            )}
+            {backups === null ? (
+              <div className="space-y-2">
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-16 w-full" />
+              </div>
+            ) : backups.length === 0 ? (
+              <p className="text-muted-foreground text-sm">No backups available.</p>
+            ) : (
+              <div className="space-y-2">
+                {backups.map((backup) => (
+                  <Card key={backup.name}>
+                    <CardContent className="flex items-center justify-between">
+                      <div>
+                        <div className="font-medium text-sm">{backup.name}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {formatTime(backup.createdAt)} — {formatBytes(backup.sizeBytes)}
+                        </div>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => api.openUrl(backup.path)}
+                        >
+                          Show
                         </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Restore from backup?</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            This will restore config and workspace files from backup "{backup.name}". Current files will be overwritten.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel>Cancel</AlertDialogCancel>
-                          <AlertDialogAction
-                            onClick={() => {
-                              api.restoreFromBackup(backup.name)
-                                .then((msg) => setBackupMessage(msg))
-                                .catch((e) => setBackupMessage(`Restore failed: ${e}`));
-                            }}
-                          >
-                            Restore
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button size="sm" variant="destructive">
-                          Delete
-                        </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Delete backup?</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            This will permanently delete backup "{backup.name}". This action cannot be undone.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel>Cancel</AlertDialogCancel>
-                          <AlertDialogAction
-                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                            onClick={() => {
-                              api.deleteBackup(backup.name)
-                                .then(() => {
-                                  setBackupMessage(`Deleted backup "${backup.name}"`);
-                                  refreshBackups();
-                                })
-                                .catch((e) => setBackupMessage(`Delete failed: ${e}`));
-                            }}
-                          >
-                            Delete
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button size="sm" variant="outline">
+                              Restore
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Restore from backup?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will restore config and workspace files from backup "{backup.name}". Current files will be overwritten.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={() => {
+                                  api.restoreFromBackup(backup.name)
+                                    .then((msg) => setBackupMessage(msg))
+                                    .catch((e) => setBackupMessage(`Restore failed: ${e}`));
+                                }}
+                              >
+                                Restore
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button size="sm" variant="destructive">
+                              Delete
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Delete backup?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will permanently delete backup "{backup.name}". This action cannot be undone.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                onClick={() => {
+                                  api.deleteBackup(backup.name)
+                                    .then(() => {
+                                      setBackupMessage(`Deleted backup "${backup.name}"`);
+                                      refreshBackups();
+                                    })
+                                    .catch((e) => setBackupMessage(`Delete failed: ${e}`));
+                                }}
+                              >
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+          </>
         )}
 
       {/* Create Agent Dialog */}

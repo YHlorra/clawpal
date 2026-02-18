@@ -242,3 +242,25 @@ export interface BackupInfo {
   createdAt: string;
   sizeBytes: number;
 }
+
+export interface SshHost {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  authMethod: "key" | "ssh_config";
+  keyPath?: string;
+}
+
+export interface SshExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+export interface SftpEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+}

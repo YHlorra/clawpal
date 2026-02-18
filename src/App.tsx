@@ -8,6 +8,8 @@ import { Doctor } from "./pages/Doctor";
 import { Channels } from "./pages/Channels";
 import { Chat } from "./components/Chat";
 import { DiffViewer } from "./components/DiffViewer";
+import { InstanceTabBar } from "./components/InstanceTabBar";
+import { InstanceContext } from "./lib/instance-context";
 import { api } from "./lib/api";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -29,7 +31,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
-import type { DiscordGuildChannel } from "./lib/types";
+import type { DiscordGuildChannel, SshHost } from "./lib/types";
 
 type Route = "home" | "recipes" | "cook" | "history" | "channels" | "doctor" | "settings";
 
@@ -47,6 +49,29 @@ export function App() {
   const [recipeSource, setRecipeSource] = useState<string | undefined>(undefined);
   const [discordGuildChannels, setDiscordGuildChannels] = useState<DiscordGuildChannel[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
+
+  // SSH remote instance state
+  const [activeInstance, setActiveInstance] = useState("local");
+  const [sshHosts, setSshHosts] = useState<SshHost[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<Record<string, "connected" | "disconnected" | "error">>({});
+
+  const refreshHosts = useCallback(() => {
+    api.listSshHosts().then(setSshHosts).catch((e) => console.error("Failed to load SSH hosts:", e));
+  }, []);
+
+  useEffect(() => {
+    refreshHosts();
+  }, [refreshHosts]);
+
+  const handleInstanceSelect = useCallback((id: string) => {
+    setActiveInstance(id);
+    if (id !== "local") {
+      setConnectionStatus((prev) => ({ ...prev, [id]: prev[id] || "disconnected" }));
+      api.sshConnect(id)
+        .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })))
+        .catch(() => setConnectionStatus((prev) => ({ ...prev, [id]: "error" })));
+    }
+  }, []);
 
   // Config dirty state
   const [dirty, setDirty] = useState(false);
@@ -145,7 +170,15 @@ export function App() {
 
   return (
     <>
-    <div className="flex h-screen">
+    <div className="flex flex-col h-screen">
+      <InstanceTabBar
+        hosts={sshHosts}
+        activeId={activeInstance}
+        connectionStatus={connectionStatus}
+        onSelect={handleInstanceSelect}
+        onHostsChange={refreshHosts}
+      />
+      <div className="flex flex-1 overflow-hidden">
       <aside className="w-[200px] min-w-[200px] bg-muted border-r border-border flex flex-col py-4">
         <h1 className="px-4 text-lg font-bold mb-4">ClawPal</h1>
         <nav className="flex flex-col gap-1 px-2 flex-1">
@@ -235,6 +268,7 @@ export function App() {
           </div>
         )}
       </aside>
+      <InstanceContext.Provider value={{ instanceId: activeInstance, isRemote: activeInstance !== "local" }}>
       <main className="flex-1 overflow-y-auto p-4 relative">
         {/* Chat toggle -- top-right corner */}
         {!chatOpen && (
@@ -291,6 +325,7 @@ export function App() {
           <Settings key={configVersion} onDataChange={bumpConfigVersion} />
         )}
       </main>
+      </InstanceContext.Provider>
 
       {/* Chat Panel -- inline, pushes main content */}
       {chatOpen && (
@@ -311,6 +346,7 @@ export function App() {
           </div>
         </aside>
       )}
+      </div>
     </div>
 
     {/* Apply Changes Dialog */}

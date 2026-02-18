@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentOverview, AgentSessionAnalysis, ApplyResult, BackupInfo, ChannelNode, ConfigDirtyState, DiscordGuildChannel, HistoryItem, ModelCatalogProvider, ModelProfile, PreviewResult, ProviderAuthSuggestion, Recipe, ResolvedApiKey, StatusLight, SystemStatus, DoctorReport, MemoryFile, SessionFile } from "./types";
+import type { AgentOverview, AgentSessionAnalysis, ApplyResult, BackupInfo, ChannelNode, ConfigDirtyState, DiscordGuildChannel, HistoryItem, ModelCatalogProvider, ModelProfile, PreviewResult, ProviderAuthSuggestion, Recipe, ResolvedApiKey, StatusLight, SystemStatus, DoctorReport, MemoryFile, SessionFile, SshHost, SshExecResult, SftpEntry } from "./types";
 
 export const api = {
   getSystemStatus: (): Promise<SystemStatus> =>
@@ -106,4 +106,38 @@ export const api = {
     invoke("discard_config_changes", {}),
   applyPendingChanges: (): Promise<boolean> =>
     invoke("apply_pending_changes", {}),
+
+  // SSH host management
+  listSshHosts: (): Promise<SshHost[]> =>
+    invoke("list_ssh_hosts", {}),
+  upsertSshHost: (host: SshHost): Promise<SshHost> =>
+    invoke("upsert_ssh_host", { host }),
+  deleteSshHost: (hostId: string): Promise<boolean> =>
+    invoke("delete_ssh_host", { hostId }),
+
+  // SSH connection
+  sshConnect: (hostId: string): Promise<boolean> =>
+    invoke("ssh_connect", { hostId }),
+  sshDisconnect: (hostId: string): Promise<boolean> =>
+    invoke("ssh_disconnect", { hostId }),
+  sshStatus: (hostId: string): Promise<string> =>
+    invoke("ssh_status", { hostId }),
+
+  // SSH primitives
+  sshExec: (hostId: string, command: string): Promise<SshExecResult> =>
+    invoke("ssh_exec", { hostId, command }),
+  sftpReadFile: (hostId: string, path: string): Promise<string> =>
+    invoke("sftp_read_file", { hostId, path }),
+  sftpWriteFile: (hostId: string, path: string, content: string): Promise<boolean> =>
+    invoke("sftp_write_file", { hostId, path, content }),
+  sftpListDir: (hostId: string, path: string): Promise<SftpEntry[]> =>
+    invoke("sftp_list_dir", { hostId, path }),
+  sftpRemoveFile: (hostId: string, path: string): Promise<boolean> =>
+    invoke("sftp_remove_file", { hostId, path }),
+
+  // Remote business commands
+  remoteReadRawConfig: (hostId: string): Promise<unknown> =>
+    invoke("remote_read_raw_config", { hostId }),
+  remoteGetSystemStatus: (hostId: string): Promise<Record<string, unknown>> =>
+    invoke("remote_get_system_status", { hostId }),
 };
