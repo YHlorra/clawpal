@@ -18,8 +18,20 @@
       }
     ]
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU2QjE4N0M1Mjc0NEEwOUIKUldTYm9FUW54WWV4VnZMQ2JTL1NvZjdKZW55RVhhUENuZ3NxMDFwUVFkSng0UXo3N1lLKzlYYWsK",
+      "endpoints": [
+        "https://github.com/zhixianio/clawpal/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
