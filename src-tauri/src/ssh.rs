@@ -203,6 +203,8 @@ impl SshConnectionPool {
     }
 
     /// Try all keys offered by the ssh-agent until one succeeds.
+    /// Only available on Unix (SSH agent uses a Unix domain socket).
+    #[cfg(unix)]
     async fn authenticate_with_agent(
         &self,
         session: &mut client::Handle<SshHandler>,
@@ -238,6 +240,15 @@ impl SshConnectionPool {
         }
 
         Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    async fn authenticate_with_agent(
+        &self,
+        _session: &mut client::Handle<SshHandler>,
+        _username: &str,
+    ) -> Result<bool, String> {
+        Err("SSH agent forwarding is not supported on Windows".into())
     }
 
     // -- resolve_home -----------------------------------------------------
