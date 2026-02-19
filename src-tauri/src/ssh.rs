@@ -154,25 +154,41 @@ impl SshConnectionPool {
                     .map_err(|e| format!("Public key auth failed: {e}"))?
             }
             "ssh_config" => {
-                // Try IdentityFile from ~/.ssh/config first, then fall back to agent
+                // Try IdentityFile from ~/.ssh/config, then default key paths, then agent
                 let identity_file = parse_ssh_config_identity(&config.host);
-                if let Some(key_path) = identity_file {
-                    let expanded = shellexpand::tilde(&key_path).to_string();
-                    match russh::keys::load_secret_key(&expanded, None) {
-                        Ok(key_pair) => {
-                            session
-                                .authenticate_publickey(&username, Arc::new(key_pair))
-                                .await
-                                .map_err(|e| format!("Public key auth failed: {e}"))?
-                        }
-                        Err(_) => {
-                            // Key file failed to load, try agent as fallback
-                            self.authenticate_with_agent(&mut session, &username).await?
+
+                // Build list of key paths to try
+                let mut key_paths: Vec<String> = Vec::new();
+                if let Some(ref p) = identity_file {
+                    key_paths.push(shellexpand::tilde(p).to_string());
+                }
+                // Default key paths (same order as OpenSSH)
+                let home = shellexpand::tilde("~").to_string();
+                for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+                    let p = format!("{home}/.ssh/{name}");
+                    if !key_paths.contains(&p) {
+                        key_paths.push(p);
+                    }
+                }
+
+                let mut authenticated = false;
+                for path in &key_paths {
+                    if let Ok(key_pair) = russh::keys::load_secret_key(path, None) {
+                        match session
+                            .authenticate_publickey(&username, Arc::new(key_pair))
+                            .await
+                        {
+                            Ok(true) => { authenticated = true; break; }
+                            _ => continue,
                         }
                     }
-                } else {
-                    // No IdentityFile in config, try agent
+                }
+
+                if !authenticated {
+                    // All key files failed, try SSH agent as last resort
                     self.authenticate_with_agent(&mut session, &username).await?
+                } else {
+                    true
                 }
             }
             "password" => {
@@ -210,9 +226,28 @@ impl SshConnectionPool {
         session: &mut client::Handle<SshHandler>,
         username: &str,
     ) -> Result<bool, String> {
-        let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-            .await
-            .map_err(|e| format!("Could not connect to SSH agent: {e}"))?;
+        let mut agent = match russh::keys::agent::client::AgentClient::connect_env().await {
+            Ok(a) => a,
+            Err(_) => {
+                // GUI apps may not have SSH_AUTH_SOCK; ask launchd for the socket path
+                let output = tokio::task::spawn_blocking(|| {
+                    std::process::Command::new("launchctl")
+                        .args(["getenv", "SSH_AUTH_SOCK"])
+                        .output()
+                }).await
+                    .map_err(|e| format!("Could not determine SSH agent socket: {e}"))?
+                    .map_err(|e| format!("Could not determine SSH agent socket: {e}"))?;
+                let sock_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if sock_path.is_empty() {
+                    return Err("Could not connect to SSH agent: SSH_AUTH_SOCK not set and launchctl lookup failed".into());
+                }
+                russh::keys::agent::client::AgentClient::connect(
+                    tokio::net::UnixStream::connect(&sock_path)
+                        .await
+                        .map_err(|e| format!("Could not connect to SSH agent at {sock_path}: {e}"))?
+                )
+            }
+        };
 
         let identities = agent
             .request_identities()

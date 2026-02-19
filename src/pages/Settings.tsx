@@ -116,7 +116,7 @@ function AutocompleteField({
 
 export function Settings({ onDataChange }: { onDataChange?: () => void }) {
   const { instanceId, isRemote, isConnected } = useInstance();
-  const [profiles, setProfiles] = useState<ModelProfile[]>([]);
+  const [profiles, setProfiles] = useState<ModelProfile[] | null>(null);
   const [catalog, setCatalog] = useState<ModelCatalogProvider[]>([]);
   const [apiKeys, setApiKeys] = useState<ResolvedApiKey[]>([]);
   const [form, setForm] = useState<ProfileForm>(emptyForm());
@@ -190,7 +190,7 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
     }
     if (isRemote) {
       // For remote: check if any existing profile with the same provider already has a key
-      const sameProviderProfile = profiles.find(
+      const sameProviderProfile = (profiles || []).find(
         (p) => p.provider === form.provider && maskedKeyMap.has(p.id) && maskedKeyMap.get(p.id) !== "..."
       );
       if (sameProviderProfile) {
@@ -419,11 +419,13 @@ export function Settings({ onDataChange }: { onDataChange?: () => void }) {
                 <CardTitle>Model Profiles</CardTitle>
               </CardHeader>
               <CardContent>
-                {profiles.length === 0 && (
+                {profiles === null ? (
+                  <p className="text-muted-foreground">Loading profiles...</p>
+                ) : profiles.length === 0 ? (
                   <p className="text-muted-foreground">No model profiles yet.</p>
-                )}
+                ) : null}
                 <div className="grid gap-2">
-                  {profiles.map((profile) => (
+                  {(profiles || []).map((profile) => (
                     <div
                       key={profile.id}
                       className="border border-border p-2.5 rounded-lg"

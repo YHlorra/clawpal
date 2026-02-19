@@ -59,6 +59,42 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      - name: Import Apple certificate (macOS only)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Decode certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          # Clean up certificate file
+          rm "$CERTIFICATE_PATH"
+
+      - name: Write Apple API key (macOS only)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          mkdir -p ~/.private_keys
+          echo "$APPLE_API_KEY_CONTENT" > ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -67,6 +103,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ''
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ~/.private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ClawPal ${{ github.ref_name }}
@@ -75,13 +117,13 @@ jobs:
 
             ### Installation
 
-            **macOS** (unsigned — requires manual approval):
+            **macOS**:
             - Download the `.dmg` for your architecture (ARM for Apple Silicon, x64 for Intel)
             - Open the DMG and drag ClawPal to Applications
-            - First launch: right-click the app → Open, or run `xattr -cr /Applications/ClawPal.app`
 
             **Windows** (unsigned — SmartScreen will warn):
-            - Download the `.exe` (NSIS installer) or `.msi`
+            - **Portable**: Download `ClawPal_portable_x64.exe` — no install needed (requires WebView2)
+            - **Installer**: Download the NSIS `.exe` or `.msi`
             - If SmartScreen blocks: click "More info" → "Run anyway"
 
             **Linux**:
@@ -90,3 +132,22 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      - name: Upload Windows portable exe
+        if: matrix.platform == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/clawpal.exe" -ErrorAction SilentlyContinue
+          if ($exe) {
+            $dest = "ClawPal_portable_x64.exe"
+            Copy-Item $exe.FullName $dest
+            gh release upload ${{ github.ref_name }} $dest --clobber
+          }
+
+      - name: Cleanup Apple signing (macOS only)
+        if: ${{ contains(matrix.target, 'apple-darwin') && always() }}
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+          rm -f ~/.private_keys/AuthKey_*.p8 2>/dev/null || true

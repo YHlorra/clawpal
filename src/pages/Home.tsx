@@ -62,6 +62,7 @@ export function Home({
   const [status, setStatus] = useState<StatusLight | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<{ available: boolean; latest?: string } | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [agents, setAgents] = useState<AgentOverview[] | null>(null);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [backups, setBackups] = useState<BackupInfo[] | null>(null);
@@ -161,12 +162,15 @@ export function Home({
 
   // Update check — deferred, runs once (not in poll loop)
   useEffect(() => {
+    setCheckingUpdate(true);
+    setUpdateInfo(null);
     const timer = setTimeout(() => {
       if (isRemote) {
-        if (!isConnected) return;
+        if (!isConnected) { setCheckingUpdate(false); return; }
         api.remoteCheckOpenclawUpdate(instanceId).then((u) => {
           setUpdateInfo({ available: u.upgradeAvailable, latest: u.latestVersion ?? undefined });
-        }).catch((e) => console.error("Failed to check remote update:", e));
+        }).catch((e) => console.error("Failed to check remote update:", e))
+          .finally(() => setCheckingUpdate(false));
       } else {
         api.getSystemStatus().then((s) => {
           setVersion(s.openclawVersion);
@@ -176,7 +180,8 @@ export function Home({
               latest: s.openclawUpdate.latestVersion,
             });
           }
-        }).catch((e) => console.error("Failed to fetch system status:", e));
+        }).catch((e) => console.error("Failed to fetch system status:", e))
+          .finally(() => setCheckingUpdate(false));
       }
     }, 500);
     return () => clearTimeout(timer);
@@ -214,7 +219,10 @@ export function Home({
             <span className="text-sm text-muted-foreground">Version</span>
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-medium">{version || "..."}</span>
-              {updateInfo?.available && updateInfo.latest && updateInfo.latest !== version && (
+              {checkingUpdate && (
+                <Badge variant="outline" className="text-muted-foreground">Checking for updates...</Badge>
+              )}
+              {!checkingUpdate && updateInfo?.available && updateInfo.latest && updateInfo.latest !== version && (
                 <>
                   <Badge variant="outline" className="text-primary border-primary">
                     {updateInfo.latest} available

@@ -63,6 +63,22 @@ export function App() {
     refreshHosts();
   }, [refreshHosts]);
 
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
+    const id = ++toastIdCounter;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    if (type !== "error") {
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 3000);
+    }
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
   const handleInstanceSelect = useCallback((id: string) => {
     setActiveInstance(id);
     if (id !== "local") {
@@ -70,9 +86,12 @@ export function App() {
       setConnectionStatus((prev) => ({ ...prev, [id]: "disconnected" }));
       api.sshConnect(id)
         .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })))
-        .catch(() => setConnectionStatus((prev) => ({ ...prev, [id]: "error" })));
+        .catch((e) => {
+          setConnectionStatus((prev) => ({ ...prev, [id]: "error" }));
+          showToast(`SSH connection failed: ${e}`, "error");
+        });
     }
-  }, []);
+  }, [showToast]);
 
   // Config dirty state
   const [dirty, setDirty] = useState(false);
@@ -83,7 +102,6 @@ export function App() {
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState("");
   const [configVersion, setConfigVersion] = useState(0);
-  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isRemote = activeInstance !== "local";
@@ -156,18 +174,6 @@ export function App() {
       })
       .catch((e) => console.error("Failed to load config diff:", e));
   };
-
-  const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
-    const id = ++toastIdCounter;
-    setToasts((prev) => [...prev, { id, message, type }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3000);
-  }, []);
-
-  const dismissToast = useCallback((id: number) => {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  }, []);
 
   const handleApplyConfirm = () => {
     setApplying(true);

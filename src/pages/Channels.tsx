@@ -62,7 +62,7 @@ export function Channels({
   const [bindings, setBindings] = useState<Binding[]>([]);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [channelNodes, setChannelNodes] = useState<ChannelNode[]>([]);
-  const [discordChannels, setDiscordChannels] = useState<DiscordGuildChannel[]>([]);
+  const [discordChannels, setDiscordChannels] = useState<DiscordGuildChannel[] | null>(null);
   const [refreshing, setRefreshing] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
 
@@ -160,7 +160,7 @@ export function Channels({
   // Discord channels grouped by guild
   const discordGuilds = useMemo(() => {
     const map = new Map<string, { guildName: string; channels: DiscordGuildChannel[] }>();
-    for (const ch of discordChannels) {
+    for (const ch of discordChannels || []) {
       if (!map.has(ch.guildId)) {
         map.set(ch.guildId, { guildName: ch.guildName, channels: [] });
       }
@@ -260,7 +260,7 @@ export function Channels({
     );
   };
 
-  const hasDiscord = discordChannels.length > 0;
+  const hasDiscord = (discordChannels || []).length > 0;
   const hasOther = otherPlatforms.length > 0;
 
   return (
@@ -275,7 +275,6 @@ export function Channels({
 
       <div className="space-y-6">
         {/* Discord section — only show for local or when Discord data exists */}
-        {(!isRemote || hasDiscord) && (
         <Card>
           <CardContent>
             <div className="flex items-center gap-2 mb-3">
@@ -293,7 +292,9 @@ export function Channels({
               )}
             </div>
 
-            {discordGuilds.length === 0 ? (
+            {discordChannels === null ? (
+              <p className="text-sm text-muted-foreground animate-pulse">Loading Discord channels...</p>
+            ) : discordGuilds.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No Discord channels cached. Click "Refresh" to discover channels from Discord.
               </p>
@@ -320,7 +321,6 @@ export function Channels({
             )}
           </CardContent>
         </Card>
-        )}
 
         {/* Other platform sections */}
         {otherPlatforms.map(([platform, nodes]) => (
@@ -376,7 +376,7 @@ export function Channels({
           if (pendingChannel) {
             handleAssign(pendingChannel.platform, pendingChannel.peerId, result.agentId);
             if (result.persona && pendingChannel.platform === "discord") {
-              const ch = discordChannels.find((c) => c.channelId === pendingChannel.peerId);
+              const ch = (discordChannels || []).find((c) => c.channelId === pendingChannel.peerId);
               if (ch) {
                 const patch = JSON.stringify({
                   channels: { discord: { guilds: { [ch.guildId]: { channels: { [ch.channelId]: { systemPrompt: result.persona } } } } } },

@@ -2204,16 +2204,22 @@ fn parse_openclaw_update_text(raw: &str) -> Option<(Option<String>, String, Stri
 }
 
 fn query_openclaw_latest_npm() -> Result<Option<String>, String> {
-    let output = run_external_command_raw(&["npm", "view", "openclaw", "version"]);
-    let output = match output {
-        Ok(output) => output,
-        Err(_) => return Ok(None),
-    };
-    if output.stdout.trim().is_empty() {
+    // Query npm registry directly via HTTP — no local npm CLI needed
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let resp = client
+        .get("https://registry.npmjs.org/openclaw/latest")
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| format!("npm registry request failed: {e}"))?;
+    if !resp.status().is_success() {
         return Ok(None);
     }
-    let trimmed = output.stdout.trim().trim_matches(['\"', '\''].as_ref());
-    Ok(Some(trimmed.to_string()))
+    let body: Value = resp.json().map_err(|e| format!("npm registry parse failed: {e}"))?;
+    let version = body.get("version").and_then(Value::as_str).map(String::from);
+    Ok(version)
 }
 
 /// Fetch a Discord guild name via the Discord REST API using a bot token.
