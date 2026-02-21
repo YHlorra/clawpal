@@ -32,10 +32,32 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(|value| expand_user_path(&value))
 }
 
+/// Scan all available drives (C-Z) for .openclaw directories containing openclaw.json
+fn scan_all_drives_for_openclaw() -> Option<PathBuf> {
+    let drive_letters = b'C'..=b'Z';
+    
+    for letter in drive_letters {
+        let drive = format!("{}:\\", letter as char);
+        let openclaw_path = PathBuf::from(&drive).join(".openclaw");
+        let config_path = openclaw_path.join("openclaw.json");
+        
+        if config_path.exists() {
+            eprintln!("[ClawPal] Found OpenClaw at: {:?}", openclaw_path);
+            return Some(openclaw_path);
+        }
+    }
+    None
+}
+
 pub fn resolve_paths() -> OpenClawPaths {
     let home = home_dir().unwrap_or_else(|| Path::new(".").to_path_buf());
-    let openclaw_dir =
-        env_path("CLAWPAL_OPENCLAW_DIR").or_else(|| env_path("OPENCLAW_HOME")).unwrap_or_else(|| home.join(".openclaw"));
+    
+    // Priority: env var > scan all drives > default home directory
+    let openclaw_dir = env_path("CLAWPAL_OPENCLAW_DIR")
+        .or_else(|| env_path("OPENCLAW_HOME"))
+        .or_else(|| scan_all_drives_for_openclaw())
+        .unwrap_or_else(|| home.join(".openclaw"));
+        
     let clawpal_dir =
         env_path("CLAWPAL_DATA_DIR").unwrap_or_else(|| home.join(".clawpal"));
 
