@@ -116,12 +116,6 @@ export interface SystemStatus {
   };
 }
 
-export interface MemoryFile {
-  path: string;
-  relativePath: string;
-  sizeBytes: number;
-}
-
 export interface SessionFile {
   path: string;
   relativePath: string;
@@ -224,30 +218,21 @@ export interface AgentOverview {
   workspace?: string;
 }
 
-export interface StatusLight {
+export interface InstanceStatus {
   healthy: boolean;
   activeAgents: number;
   globalDefaultModel?: string;
+  fallbackModels?: string[];
 }
 
-export interface RemoteSystemStatus {
-  healthy: boolean;
-  openclawVersion: string;
-  activeAgents: number;
-  globalDefaultModel?: string;
-  configPath: string;
-  openclawDir: string;
+export interface StatusExtra {
+  openclawVersion?: string;
+  duplicateInstalls?: string[];
 }
 
 export interface Binding {
   agentId: string;
   match: { channel: string; peer?: { id: string; kind: string } };
-}
-
-export interface ConfigDirtyState {
-  dirty: boolean;
-  baseline: string;
-  current: string;
 }
 
 export interface BackupInfo {
@@ -268,6 +253,14 @@ export interface SshHost {
   password?: string;
 }
 
+export interface SshConfigHostSuggestion {
+  hostAlias: string;
+  hostName?: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+}
+
 export interface SshExecResult {
   stdout: string;
   stderr: string;
@@ -278,4 +271,181 @@ export interface SftpEntry {
   name: string;
   isDir: boolean;
   size: number;
+}
+
+export type RescueBotAction = "set" | "activate" | "status" | "deactivate" | "unset";
+
+export interface RescueBotCommandResult {
+  command: string[];
+  output: {
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  };
+}
+
+export interface RescueBotManageResult {
+  action: RescueBotAction;
+  profile: string;
+  mainPort: number;
+  rescuePort: number;
+  minRecommendedPort: number;
+  wasAlreadyConfigured: boolean;
+  commands: RescueBotCommandResult[];
+}
+
+export interface RescuePrimaryCheckItem {
+  id: string;
+  title: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface RescuePrimaryIssue {
+  id: string;
+  code: string;
+  severity: "error" | "warn" | "info";
+  message: string;
+  autoFixable: boolean;
+  fixHint?: string;
+  source: "rescue" | "primary";
+}
+
+export interface RescuePrimaryDiagnosisResult {
+  status: "healthy" | "degraded" | "broken";
+  checkedAt: string;
+  targetProfile: string;
+  rescueProfile: string;
+  rescueConfigured: boolean;
+  rescuePort?: number;
+  checks: RescuePrimaryCheckItem[];
+  issues: RescuePrimaryIssue[];
+}
+
+export interface RescuePrimaryRepairStep {
+  id: string;
+  title: string;
+  ok: boolean;
+  detail: string;
+  command?: string[];
+}
+
+export interface RescuePrimaryRepairResult {
+  attemptedAt: string;
+  targetProfile: string;
+  rescueProfile: string;
+  selectedIssueIds: string[];
+  appliedIssueIds: string[];
+  skippedIssueIds: string[];
+  failedIssueIds: string[];
+  steps: RescuePrimaryRepairStep[];
+  before: RescuePrimaryDiagnosisResult;
+  after: RescuePrimaryDiagnosisResult;
+}
+
+// Cron
+
+export type WatchdogJobStatus = "ok" | "pending" | "triggered" | "retrying" | "escalated";
+
+export interface CronSchedule {
+  kind: "cron" | "every" | "at";
+  expr?: string;
+  tz?: string;
+  everyMs?: number;
+  at?: string;
+}
+
+export interface CronJobState {
+  lastRunAtMs?: number;
+  lastStatus?: string;
+  lastError?: string;
+}
+
+export interface CronJob {
+  jobId: string;
+  name: string;
+  schedule: CronSchedule;
+  sessionTarget: "main" | "isolated";
+  agentId?: string;
+  enabled: boolean;
+  description?: string;
+  state?: CronJobState;
+}
+
+export interface CronRun {
+  jobId: string;
+  startedAt: string;
+  endedAt?: string;
+  outcome: string;
+  error?: string;
+  ts?: number;
+  runAtMs?: number;
+  durationMs?: number;
+  summary?: string;
+}
+
+export interface WatchdogJobState {
+  status: WatchdogJobStatus;
+  lastScheduledAt?: string;
+  lastRunAt?: string | null;
+  retries: number;
+  lastError?: string;
+  escalatedAt?: string;
+}
+
+export interface WatchdogStatus {
+  pid: number;
+  startedAt: string;
+  lastCheckAt: string;
+  gatewayHealthy: boolean;
+  jobs: Record<string, WatchdogJobState>;
+}
+
+// Command Queue
+
+export interface PendingCommand {
+  id: string;
+  label: string;
+  command: string[];
+  createdAt: string;
+}
+
+export interface PreviewQueueResult {
+  commands: PendingCommand[];
+  configBefore: string;
+  configAfter: string;
+  errors: string[];
+}
+
+// Doctor Agent
+
+export interface GatewayCredentials {
+  token: string;
+  deviceId: string;
+  privateKeyPem: string;
+}
+
+export interface DoctorInvoke {
+  id: string;
+  command: string;
+  args: Record<string, unknown>;
+  type: "read" | "write";
+}
+
+export interface DoctorChatMessage {
+  id: string;
+  role: "assistant" | "user" | "tool-call" | "tool-result";
+  content: string;
+  invoke?: DoctorInvoke;
+  invokeResult?: unknown;
+  invokeId?: string;
+  status?: "pending" | "approved" | "rejected" | "auto";
+}
+
+export interface ApplyQueueResult {
+  ok: boolean;
+  appliedCount: number;
+  totalCount: number;
+  error: string | null;
+  rolledBack: boolean;
 }

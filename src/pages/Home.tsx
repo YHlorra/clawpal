@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,9 +25,20 @@ import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { UpgradeDialog } from "@/components/UpgradeDialog";
 import { RecipeCard } from "@/components/RecipeCard";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { StatusLight, AgentOverview, Recipe, BackupInfo, ModelProfile, RemoteSystemStatus } from "../lib/types";
+import type { InstanceStatus, StatusExtra, AgentOverview, Recipe, BackupInfo, ModelProfile } from "../lib/types";
 import { formatTime, formatBytes } from "@/lib/utils";
-import { useInstance } from "@/lib/instance-context";
+import { useApi } from "@/lib/use-api";
+import { profileToModelValue } from "@/lib/model-value";
+
+type OpenclawUpdateLatch = {
+  checkedAt: number;
+  available: boolean;
+  latest?: string;
+  installedVersion?: string;
+};
+
+const OPENCLAW_UPDATE_LATCH = new Map<string, OpenclawUpdateLatch>();
+const OPENCLAW_UPDATE_NO_UPDATE_TTL_MS = 30 * 60 * 1000;
 
 interface AgentGroup {
   identity: string;
@@ -56,13 +66,16 @@ function groupAgents(agents: AgentOverview[]): AgentGroup[] {
 export function Home({
   onCook,
   showToast,
+  onNavigate,
 }: {
   onCook?: (recipeId: string, source?: string) => void;
   showToast?: (message: string, type?: "success" | "error") => void;
+  onNavigate?: (route: string) => void;
 }) {
   const { t } = useTranslation();
-  const { instanceId, isRemote, isConnected } = useInstance();
-  const [status, setStatus] = useState<StatusLight | null>(null);
+  const ua = useApi();
+  const [status, setStatus] = useState<InstanceStatus | null>(null);
+  const [statusExtra, setStatusExtra] = useState<StatusExtra | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<{ available: boolean; latest?: string } | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -71,37 +84,67 @@ export function Home({
   const [backups, setBackups] = useState<BackupInfo[] | null>(null);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [savingModel, setSavingModel] = useState(false);
+  const [fallbackSelectKey, setFallbackSelectKey] = useState(0);
   const [backingUp, setBackingUp] = useState(false);
   const [backupMessage, setBackupMessage] = useState("");
-
 
   // Create agent dialog
   const [showCreateAgent, setShowCreateAgent] = useState(false);
   const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
 
+  const resolveModelValue = (profileId: string | null): string | null => {
+    if (!profileId) return null;
+    const profile = modelProfiles.find((p) => p.id === profileId);
+    if (!profile) return profileId;
+    return profileToModelValue(profile);
+  };
+
+  // Skip polling refreshes while there are queued commands (to preserve optimistic UI)
+  const hasPendingRef = useRef(false);
+  useEffect(() => {
+    const check = () => { ua.queuedCommandsCount().then((n) => { hasPendingRef.current = n > 0; }).catch(() => {}); };
+    check();
+    const interval = setInterval(check, ua.isRemote ? 10000 : 3000);
+    return () => clearInterval(interval);
+  }, [ua]);
+
   // Health status with grace period: retry quickly when unhealthy, then slow-poll
   const [statusSettled, setStatusSettled] = useState(false);
   const retriesRef = useRef(0);
   const remoteErrorShownRef = useRef(false);
+  const remoteUnhealthyStreakRef = useRef(0);
+
+  const statusInFlightRef = useRef(false);
 
   const fetchStatus = useCallback(() => {
-    if (isRemote) {
-      if (!isConnected) return; // Wait for SSH connection
-      api.remoteGetSystemStatus(instanceId).then((s: RemoteSystemStatus) => {
-        setStatus({ healthy: s.healthy, activeAgents: s.activeAgents, globalDefaultModel: s.globalDefaultModel });
+    if (ua.isRemote && !ua.isConnected) return; // Wait for SSH connection
+    if (hasPendingRef.current) return; // Don't overwrite optimistic UI
+    if (statusInFlightRef.current) return; // Prevent overlapping polls
+    statusInFlightRef.current = true;
+    ua.getInstanceStatus().then((s) => {
+      let resolvedHealthy = s.healthy;
+      if (ua.isRemote) {
+        if (s.healthy) {
+          remoteUnhealthyStreakRef.current = 0;
+        } else {
+          remoteUnhealthyStreakRef.current += 1;
+          if (remoteUnhealthyStreakRef.current < 2) {
+            resolvedHealthy = true;
+          }
+        }
+      }
+      const next = { ...s, healthy: resolvedHealthy };
+      // If remote config fetch failed (agents=0, no model), keep previous good data
+      // rather than flashing "unset" — only update health which is independent.
+      if (ua.isRemote && s.activeAgents === 0 && !s.globalDefaultModel) {
+        setStatus((prev) => prev ? { ...prev, healthy: resolvedHealthy } : next);
+      } else {
+        setStatus(next);
+      }
+      if (ua.isRemote) {
         setStatusSettled(true);
         remoteErrorShownRef.current = false;
-        if (s.openclawVersion) setVersion(s.openclawVersion);
-      }).catch((e) => {
-        console.error("Failed to fetch remote status:", e);
-        if (!remoteErrorShownRef.current) {
-          remoteErrorShownRef.current = true;
-          showToast?.(t('home.remoteReadFailed', { error: String(e) }), "error");
-        }
-      });
-    } else {
-      api.getStatusLight().then((s) => {
-        setStatus(s);
+      } else {
         if (s.healthy) {
           setStatusSettled(true);
           retriesRef.current = 0;
@@ -110,66 +153,101 @@ export function Home({
         } else {
           setStatusSettled(true);
         }
-      }).catch((e) => console.error("Failed to fetch status:", e));
-    }
-  }, [isRemote, isConnected, instanceId]);
+      }
+    }).catch((e) => {
+      if (ua.isRemote) {
+        console.error("Failed to fetch remote status:", e);
+        if (!remoteErrorShownRef.current) {
+          remoteErrorShownRef.current = true;
+          showToast?.(t('home.remoteReadFailed', { error: String(e) }), "error");
+        }
+      } else {
+        console.error("Failed to fetch status:", e);
+      }
+    }).finally(() => {
+      statusInFlightRef.current = false;
+    });
+  }, [ua, showToast, t]);
 
   useEffect(() => {
     remoteErrorShownRef.current = false;
+    remoteUnhealthyStreakRef.current = 0;
     fetchStatus();
-    // Poll fast (2s) while not settled, slow (10s) once settled
-    const interval = setInterval(fetchStatus, statusSettled ? 10000 : 2000);
+    // Poll fast (2s) while not settled, slow (10s) once settled; remote always slow
+    const interval = setInterval(fetchStatus, ua.isRemote ? 30000 : (statusSettled ? 10000 : 2000));
     return () => clearInterval(interval);
   }, [fetchStatus, statusSettled]);
 
-  const refreshAgents = useCallback(() => {
-    if (isRemote) {
-      if (!isConnected) return; // Wait for SSH connection
-      api.remoteListAgentsOverview(instanceId).then((a) => {
-        setAgents(a);
-        remoteErrorShownRef.current = false;
-      }).catch((e) => {
-        console.error("Failed to load remote agents:", e);
-        if (!remoteErrorShownRef.current) {
-          remoteErrorShownRef.current = true;
-          showToast?.(t('home.remoteAgentsFailed', { error: String(e) }), "error");
-        }
-      });
-      return;
+  // Tier 2: version + duplicate detection — called once on mount (not polled)
+  const fetchStatusExtra = useCallback(() => {
+    if (ua.isRemote && !ua.isConnected) return;
+    ua.getStatusExtra().then((extra) => {
+      setStatusExtra(extra);
+      if (extra.openclawVersion) setVersion(extra.openclawVersion);
+    }).catch((e) => {
+      console.error("Failed to fetch status extra:", e);
+    });
+  }, [ua]);
+
+  useEffect(() => {
+    // Delay for remote to avoid SSH burst (tier 1 + tier 2 = 4 concurrent SSH
+    // processes on Windows which has no ControlMaster multiplexing).
+    if (ua.isRemote) {
+      const timer = setTimeout(fetchStatusExtra, 3000);
+      return () => clearTimeout(timer);
     }
-    api.listAgentsOverview().then(setAgents).catch((e) => console.error("Failed to load agents:", e));
-  }, [isRemote, isConnected, instanceId]);
+    fetchStatusExtra();
+  }, [fetchStatusExtra, ua.isRemote]);
+
+  const refreshAgents = useCallback(() => {
+    if (ua.isRemote && !ua.isConnected) return; // Wait for SSH connection
+    if (hasPendingRef.current) return; // Don't overwrite optimistic UI
+    ua.listAgents().then((a) => {
+      setAgents(a);
+      if (ua.isRemote) remoteErrorShownRef.current = false;
+    }).catch((e) => {
+      if (ua.isRemote) {
+        // SSH sessions can be transiently unavailable during tab switch;
+        // retry once after a short delay before surfacing the error.
+        setTimeout(() => {
+          ua.listAgents().then((a) => {
+            setAgents(a);
+            remoteErrorShownRef.current = false;
+          }).catch((e2) => {
+            console.error("Failed to load remote agents:", e2);
+            if (!remoteErrorShownRef.current) {
+              remoteErrorShownRef.current = true;
+              showToast?.(t('home.remoteAgentsFailed', { error: String(e2) }), "error");
+            }
+          });
+        }, 1500);
+      } else {
+        console.error("Failed to load agents:", e);
+      }
+    });
+  }, [ua, showToast, t]);
 
   useEffect(() => {
     refreshAgents();
-    // Auto-refresh agents every 15s
-    const interval = setInterval(refreshAgents, 15000);
+    // Auto-refresh agents (remote less frequently to avoid ssh process spam)
+    const interval = setInterval(refreshAgents, ua.isRemote ? 30000 : 15000);
     return () => clearInterval(interval);
   }, [refreshAgents]);
 
   useEffect(() => {
-    api.listRecipes().then((r) => setRecipes(r.slice(0, 4))).catch((e) => console.error("Failed to load recipes:", e));
-  }, []);
+    ua.listRecipes().then((r) => setRecipes(r.slice(0, 4))).catch((e) => console.error("Failed to load recipes:", e));
+  }, [ua]);
 
-  const refreshBackups = () => {
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteListBackups(instanceId).then(setBackups).catch((e) => console.error("Failed to load remote backups:", e));
-    } else {
-      api.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
-    }
-  };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(refreshBackups, [isRemote, isConnected, instanceId]);
+  const refreshBackups = useCallback(() => {
+    if (ua.isRemote && !ua.isConnected) return;
+    ua.listBackups().then(setBackups).catch((e) => console.error("Failed to load backups:", e));
+  }, [ua]);
+  useEffect(refreshBackups, [refreshBackups]);
 
   useEffect(() => {
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteListModelProfiles(instanceId).then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch((e) => console.error("Failed to load remote model profiles:", e));
-    } else {
-      api.listModelProfiles().then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch((e) => console.error("Failed to load model profiles:", e));
-    }
-  }, [isRemote, isConnected, instanceId]);
+    if (ua.isRemote && !ua.isConnected) return;
+    ua.listModelProfiles().then((p) => setModelProfiles(p.filter((m) => m.enabled))).catch((e) => console.error("Failed to load model profiles:", e));
+  }, [ua]);
 
   // Match current global model value to a profile ID
   const currentModelProfileId = useMemo(() => {
@@ -177,7 +255,7 @@ export function Home({
     if (!modelVal) return null;
     const normalized = modelVal.toLowerCase();
     for (const p of modelProfiles) {
-      const profileVal = p.model.includes("/") ? p.model : `${p.provider}/${p.model}`;
+      const profileVal = profileToModelValue(p);
       if (profileVal.toLowerCase() === normalized || p.model.toLowerCase() === normalized) {
         return p.id;
       }
@@ -189,83 +267,100 @@ export function Home({
 
   // Update check — deferred, runs once (not in poll loop)
   useEffect(() => {
+    const instanceKey = ua.instanceId;
+    const latched = OPENCLAW_UPDATE_LATCH.get(instanceKey);
+    const now = Date.now();
+    if (latched?.available) {
+      setUpdateInfo({ available: true, latest: latched.latest });
+      if (latched.installedVersion) setVersion((prev) => prev || latched.installedVersion || null);
+      setCheckingUpdate(false);
+      return;
+    }
+    if (latched && now - latched.checkedAt < OPENCLAW_UPDATE_NO_UPDATE_TTL_MS) {
+      setUpdateInfo({ available: false, latest: latched.latest });
+      if (latched.installedVersion) setVersion((prev) => prev || latched.installedVersion || null);
+      setCheckingUpdate(false);
+      return;
+    }
+
     setCheckingUpdate(true);
     setUpdateInfo(null);
     const timer = setTimeout(() => {
-      if (isRemote) {
-        if (!isConnected) { setCheckingUpdate(false); return; }
-        api.remoteCheckOpenclawUpdate(instanceId).then((u) => {
-          setUpdateInfo({ available: u.upgradeAvailable, latest: u.latestVersion ?? undefined });
-        }).catch((e) => console.error("Failed to check remote update:", e))
-          .finally(() => setCheckingUpdate(false));
-      } else {
-        api.getSystemStatus().then((s) => {
-          setVersion(s.openclawVersion);
-          if (s.openclawUpdate) {
-            setUpdateInfo({
-              available: s.openclawUpdate.upgradeAvailable,
-              latest: s.openclawUpdate.latestVersion,
-            });
-          }
-        }).catch((e) => console.error("Failed to fetch system status:", e))
-          .finally(() => setCheckingUpdate(false));
-      }
-    }, 500);
+      if (ua.isRemote && !ua.isConnected) { setCheckingUpdate(false); return; }
+      ua.checkOpenclawUpdate()
+        .then((u) => {
+          const next = {
+            checkedAt: Date.now(),
+            available: u.upgradeAvailable,
+            latest: u.latestVersion ?? undefined,
+            installedVersion: u.installedVersion,
+          };
+          OPENCLAW_UPDATE_LATCH.set(instanceKey, next);
+          setUpdateInfo({ available: next.available, latest: next.latest });
+          // Fallback: set version from update check if tier 2 hasn't provided it yet
+          if (u.installedVersion) setVersion((prev) => prev || u.installedVersion);
+        })
+        .catch((e) => console.error("Failed to check update:", e))
+        .finally(() => setCheckingUpdate(false));
+    }, 2000); // Defer to avoid blocking startup with heavy CLI calls
     return () => clearTimeout(timer);
-  }, [isRemote, isConnected, instanceId]);
-
+  }, [ua]);
 
   const handleDeleteAgent = (agentId: string) => {
-    if (isRemote && !isConnected) return;
-    const deletePromise = isRemote
-      ? api.remoteDeleteAgent(instanceId, agentId)
-      : api.deleteAgent(agentId);
-    deletePromise
-      .then(() => refreshAgents())
-      .catch((e) => showToast?.(String(e), "error"));
+    if (ua.isRemote && !ua.isConnected) return;
+    ua.queueCommand(
+      `Delete agent: ${agentId}`,
+      ["openclaw", "agents", "delete", agentId, "--force"],
+    ).then(() => {
+      // Optimistic UI update
+      setAgents((prev) => prev?.filter((a) => a.id !== agentId) ?? null);
+    }).catch((e) => showToast?.(String(e), "error"));
   };
 
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-4">{t('home.title')}</h2>
+      <h2 className="text-2xl font-bold mb-6">{t('home.title')}</h2>
 
         {/* Status Summary */}
-        <h3 className="text-lg font-semibold mt-6 mb-3">{t('home.status')}</h3>
+        <h3 className="text-lg font-semibold mt-8 mb-4">{t('home.status')}</h3>
         <Card>
-          <CardContent className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-3 items-center">
-            <span className="text-sm text-muted-foreground">{t('home.health')}</span>
+          <CardContent className="grid grid-cols-[auto_1fr] gap-x-8 gap-y-4 items-center">
+            <span className="text-sm text-muted-foreground font-medium">{t('home.health')}</span>
             <span className="text-sm font-medium">
-              {!status ? "..." : status.healthy ? (
-                <Badge className="bg-green-100 text-green-700 border-0">{t('home.healthy')}</Badge>
+              {!status ? (
+                <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                  <span className="w-2 h-2 rounded-full bg-muted-foreground/30 animate-pulse" />
+                  ...
+                </span>
+              ) : status.healthy ? (
+                <Badge className="bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">{t('home.healthy')}</Badge>
               ) : !statusSettled ? (
-                <Badge className="bg-amber-100 text-amber-700 border-0">{t('home.checking')}</Badge>
+                <Badge className="bg-amber-500/10 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400">{t('home.checking')}</Badge>
               ) : (
-                <Badge className="bg-red-100 text-red-700 border-0">{t('home.unhealthy')}</Badge>
+                <Badge className="bg-red-500/10 text-red-600 dark:bg-red-500/15 dark:text-red-400">{t('home.unhealthy')}</Badge>
               )}
             </span>
 
-            <span className="text-sm text-muted-foreground">{t('home.version')}</span>
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-medium">{version || "..."}</span>
+            <span className="text-sm text-muted-foreground font-medium">{t('home.version')}</span>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="text-sm font-semibold font-mono">{version || "..."}</span>
               {checkingUpdate && (
                 <Badge variant="outline" className="text-muted-foreground">{t('home.checkingUpdates')}</Badge>
               )}
               {!checkingUpdate && updateInfo?.available && updateInfo.latest && updateInfo.latest !== version && (
                 <>
-                  <Badge variant="outline" className="text-primary border-primary">
+                  <Badge className="bg-primary/10 text-primary border border-primary/20">
                     {t('home.available', { version: updateInfo.latest })}
                   </Badge>
                   <Button
-                    size="sm"
-                    className="text-xs h-6"
+                    size="xs"
                     variant="outline"
-                    onClick={() => api.openUrl("https://github.com/openclaw/openclaw/releases")}
+                    onClick={() => ua.openUrl("https://github.com/openclaw/openclaw/releases")}
                   >
                     {t('home.view')}
                   </Button>
                   <Button
-                    size="sm"
-                    className="text-xs h-6"
+                    size="xs"
                     onClick={() => setShowUpgradeDialog(true)}
                   >
                     {t('home.upgrade')}
@@ -273,9 +368,27 @@ export function Home({
                 </>
               )}
             </div>
+            {statusExtra?.duplicateInstalls && statusExtra.duplicateInstalls.length > 0 && (
+              <>
+                <span />
+                <div className="col-span-1 rounded-lg border border-orange-400 dark:border-amber-700 bg-orange-50 dark:bg-amber-950/30 px-3 py-2 text-xs">
+                  <p className="font-semibold text-orange-800 dark:text-amber-300 mb-1">{t('home.duplicateInstalls')}</p>
+                  <ul className="space-y-0.5 font-mono text-orange-700 dark:text-amber-400">
+                    {statusExtra.duplicateInstalls.map((entry, i) => <li key={i}>{entry}</li>)}
+                  </ul>
+                  {onNavigate && (
+                    <button
+                      className="mt-1.5 text-orange-800 dark:text-amber-300 underline hover:no-underline"
+                      onClick={() => onNavigate("doctor")}
+                    >
+                      {t('home.fixInDoctor')}
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
 
-
-            <span className="text-sm text-muted-foreground">{t('home.defaultModel')}</span>
+            <span className="text-sm text-muted-foreground font-medium">{t('home.defaultModel')}</span>
             <div className="max-w-xs">
               {status ? (
                 <Select
@@ -283,16 +396,20 @@ export function Home({
                   onValueChange={(val) => {
                     if (val === "__raw__") return;
                     setSavingModel(true);
-                    const setModelPromise = isRemote
-                      ? (() => {
-                          const profile = modelProfiles.find((p) => p.id === val);
-                          const modelValue = profile ? `${profile.provider}/${profile.model}` : null;
-                          return api.remoteSetGlobalModel(instanceId, modelValue);
-                        })()
-                      : api.setGlobalModel(val === "__none__" ? null : val);
-                    setModelPromise
-                      .then(() => fetchStatus())
-                      .catch((e) => showToast?.(String(e), "error"))
+                    const modelValue = resolveModelValue(val === "__none__" ? null : val);
+                    const p = modelValue
+                      ? ua.queueCommand(
+                          `Set global model: ${modelValue}`,
+                          ["openclaw", "config", "set", "agents.defaults.model.primary", modelValue],
+                        )
+                      : ua.queueCommand(
+                          "Clear global model override",
+                          ["openclaw", "config", "unset", "agents.defaults.model.primary"],
+                        );
+                    p.then(() => {
+                      // Optimistic UI update
+                      setStatus((prev) => prev ? { ...prev, globalDefaultModel: modelValue ?? "" } : prev);
+                    }).catch((e) => showToast?.(String(e), "error"))
                       .finally(() => setSavingModel(false));
                   }}
                   disabled={savingModel}
@@ -320,11 +437,115 @@ export function Home({
                 <span className="text-sm">...</span>
               )}
             </div>
+
+            <span className="text-sm text-muted-foreground font-medium">{t('home.fallbackModels')}</span>
+            <div className="max-w-xs">
+              {status ? (
+                <div className="space-y-1.5">
+                  {(status.fallbackModels ?? []).length === 0 ? (
+                    <span className="text-xs text-muted-foreground">{t('home.noFallbacks')}</span>
+                  ) : (
+                    <div className="space-y-1">
+                      {(status.fallbackModels ?? []).map((fb, idx) => (
+                        <div key={`${fb}-${idx}`} className="flex items-center gap-1">
+                          <Badge variant="secondary" className="text-xs font-normal">
+                            {fb}
+                          </Badge>
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            className="h-5 w-5 p-0 text-muted-foreground hover:text-foreground"
+                            disabled={idx === 0}
+                            onClick={() => {
+                              const arr = [...(status.fallbackModels ?? [])];
+                              [arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]];
+                              setStatus((prev) => prev ? { ...prev, fallbackModels: arr } : prev);
+                              ua.queueCommand(
+                                `Reorder fallback models`,
+                                ["openclaw", "config", "set", "agents.defaults.model.fallbacks", JSON.stringify(arr), "--json"],
+                              ).catch((e) => showToast?.(String(e), "error"));
+                            }}
+                          >
+                            ↑
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            className="h-5 w-5 p-0 text-muted-foreground hover:text-foreground"
+                            disabled={idx === (status.fallbackModels ?? []).length - 1}
+                            onClick={() => {
+                              const arr = [...(status.fallbackModels ?? [])];
+                              [arr[idx], arr[idx + 1]] = [arr[idx + 1], arr[idx]];
+                              setStatus((prev) => prev ? { ...prev, fallbackModels: arr } : prev);
+                              ua.queueCommand(
+                                `Reorder fallback models`,
+                                ["openclaw", "config", "set", "agents.defaults.model.fallbacks", JSON.stringify(arr), "--json"],
+                              ).catch((e) => showToast?.(String(e), "error"));
+                            }}
+                          >
+                            ↓
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            className="h-5 w-5 p-0 text-muted-foreground hover:text-destructive"
+                            onClick={() => {
+                              const arr = (status.fallbackModels ?? []).filter((_, i) => i !== idx);
+                              setStatus((prev) => prev ? { ...prev, fallbackModels: arr } : prev);
+                              const cmd = arr.length > 0
+                                ? ua.queueCommand(
+                                    `Remove fallback model: ${fb}`,
+                                    ["openclaw", "config", "set", "agents.defaults.model.fallbacks", JSON.stringify(arr), "--json"],
+                                  )
+                                : ua.queueCommand(
+                                    `Remove last fallback model`,
+                                    ["openclaw", "config", "unset", "agents.defaults.model.fallbacks"],
+                                  );
+                              cmd.catch((e) => showToast?.(String(e), "error"));
+                            }}
+                          >
+                            ✕
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <Select
+                    key={fallbackSelectKey}
+                    onValueChange={(val) => {
+                      if (!val) return;
+                      const modelValue = resolveModelValue(val);
+                      if (!modelValue) return;
+                      const arr = [...(status.fallbackModels ?? []), modelValue];
+                      setStatus((prev) => prev ? { ...prev, fallbackModels: arr } : prev);
+                      ua.queueCommand(
+                        `Add fallback model: ${modelValue}`,
+                        ["openclaw", "config", "set", "agents.defaults.model.fallbacks", JSON.stringify(arr), "--json"],
+                      ).catch((e) => showToast?.(String(e), "error"));
+                      setFallbackSelectKey((k) => k + 1);
+                    }}
+                  >
+                    <SelectTrigger size="sm" className="text-xs h-7 w-auto">
+                      <SelectValue placeholder={t('home.addFallback')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {modelProfiles.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.provider}/{p.model}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : (
+                <span className="text-sm">...</span>
+              )}
+            </div>
           </CardContent>
         </Card>
 
         {/* Agents Overview -- grouped by identity */}
-        <div className="flex items-center justify-between mt-6 mb-3">
+        <div className="flex items-center justify-between mt-8 mb-4">
           <h3 className="text-lg font-semibold">{t('home.agents')}</h3>
           <Button size="sm" variant="outline" onClick={() => setShowCreateAgent(true)}>
             {t('home.newAgent')}
@@ -359,24 +580,41 @@ export function Home({
                               if (!agent.model) return "__none__";
                               const normalized = agent.model.toLowerCase();
                               for (const p of modelProfiles) {
-                                const profileVal = p.model.includes("/") ? p.model : `${p.provider}/${p.model}`;
+                                const profileVal = profileToModelValue(p);
                                 if (profileVal.toLowerCase() === normalized || p.model.toLowerCase() === normalized) {
                                   return p.id;
                                 }
                               }
                               return "__none__";
                             })()}
-                            onValueChange={(val) => {
-                              const setModelPromise = isRemote
-                                ? (() => {
-                                    const profile = modelProfiles.find((p) => p.id === val);
-                                    const modelValue = profile ? `${profile.provider}/${profile.model}` : null;
-                                    return api.remoteSetAgentModel(instanceId, agent.id, modelValue);
-                                  })()
-                                : api.setAgentModel(agent.id, val === "__none__" ? null : val);
-                              setModelPromise
-                                .then(() => refreshAgents())
-                                .catch((e) => showToast?.(String(e), "error"));
+                            onValueChange={async (val) => {
+                              const modelValue = resolveModelValue(val === "__none__" ? null : val);
+                              try {
+                                // Find agent index in config list
+                                const raw = await ua.readRawConfig();
+                                const cfg = JSON.parse(raw);
+                                const list: { id: string }[] = cfg?.agents?.list ?? [];
+                                const idx = list.findIndex((a) => a.id === agent.id);
+                                const label = modelValue
+                                  ? `Set model for ${agent.id}: ${modelValue}`
+                                  : `Clear model override for ${agent.id}`;
+                                if (idx >= 0) {
+                                  if (modelValue) {
+                                    await ua.queueCommand(label, ["openclaw", "config", "set", `agents.list.${idx}.model.primary`, JSON.stringify(modelValue), "--json"]);
+                                  } else {
+                                    await ua.queueCommand(label, ["openclaw", "config", "unset", `agents.list.${idx}.model.primary`]);
+                                  }
+                                } else if (modelValue) {
+                                  // Agent not in list yet — append
+                                  await ua.queueCommand(label, ["openclaw", "config", "set", `agents.list.${list.length}`, JSON.stringify({ id: agent.id, model: modelValue }), "--json"]);
+                                }
+                                // Optimistic UI update
+                                setAgents((prev) => prev?.map((a) =>
+                                  a.id === agent.id ? { ...a, model: modelValue ?? null } : a
+                                ) ?? null);
+                              } catch (e) {
+                                showToast?.(String(e), "error");
+                              }
                             }}
                           >
                             <SelectTrigger size="sm" className="text-xs h-6 w-auto min-w-[120px] max-w-[200px]">
@@ -396,9 +634,9 @@ export function Home({
                         </div>
                         <div className="flex items-center gap-2">
                           {agent.online ? (
-                            <Badge className="bg-green-100 text-green-700 border-0 text-xs">{t('home.online')}</Badge>
+                            <Badge className="bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400 text-xs">{t('home.active')}</Badge>
                           ) : (
-                            <Badge className="bg-red-100 text-red-700 border-0 text-xs">{t('home.offline')}</Badge>
+                            <Badge className="bg-muted text-muted-foreground border border-border text-xs">{t('home.idle')}</Badge>
                           )}
                           {agent.id !== "main" && (
                             <AlertDialog>
@@ -437,11 +675,11 @@ export function Home({
         )}
 
         {/* Recommended Recipes */}
-        <h3 className="text-lg font-semibold mt-6 mb-3">{t('home.recommendedRecipes')}</h3>
+        <h3 className="text-lg font-semibold mt-8 mb-4">{t('home.recommendedRecipes')}</h3>
         {recipes.length === 0 ? (
           <p className="text-muted-foreground">{t('home.noRecipes')}</p>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-4">
             {recipes.map((recipe) => (
               <RecipeCard
                 key={recipe.id}
@@ -454,7 +692,7 @@ export function Home({
         )}
 
         {/* Backups */}
-        <div className="flex items-center justify-between mt-6 mb-3">
+        <div className="flex items-center justify-between mt-8 mb-4">
           <h3 className="text-lg font-semibold">{t('home.backups')}</h3>
           <Button
             size="sm"
@@ -463,10 +701,7 @@ export function Home({
             onClick={() => {
               setBackingUp(true);
               setBackupMessage("");
-              const backupPromise = isRemote
-                ? api.remoteBackupBeforeUpgrade(instanceId)
-                : api.backupBeforeUpgrade();
-              backupPromise
+              ua.backupBeforeUpgrade()
                 .then((info) => {
                   setBackupMessage(t('home.backupCreated', { name: info.name }));
                   refreshBackups();
@@ -498,16 +733,16 @@ export function Home({
                     <div className="text-xs text-muted-foreground">
                       {formatTime(backup.createdAt)} — {formatBytes(backup.sizeBytes)}
                     </div>
-                    {isRemote && backup.path && (
+                    {ua.isRemote && backup.path && (
                       <div className="text-xs text-muted-foreground mt-0.5 font-mono">{backup.path}</div>
                     )}
                   </div>
                   <div className="flex gap-1.5">
-                    {!isRemote && (
+                    {!ua.isRemote && (
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => api.openUrl(backup.path)}
+                        onClick={() => ua.openUrl(backup.path)}
                       >
                         {t('home.show')}
                       </Button>
@@ -529,10 +764,7 @@ export function Home({
                           <AlertDialogCancel>{t('config.cancel')}</AlertDialogCancel>
                           <AlertDialogAction
                             onClick={() => {
-                              const restorePromise = isRemote
-                                ? api.remoteRestoreFromBackup(instanceId, backup.name)
-                                : api.restoreFromBackup(backup.name);
-                              restorePromise
+                              ua.restoreFromBackup(backup.name)
                                 .then((msg) => setBackupMessage(msg))
                                 .catch((e) => setBackupMessage(t('home.restoreFailed', { error: String(e) })));
                             }}
@@ -560,10 +792,7 @@ export function Home({
                           <AlertDialogAction
                             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                             onClick={() => {
-                              const deletePromise = isRemote
-                                ? api.remoteDeleteBackup(instanceId, backup.name)
-                                : api.deleteBackup(backup.name);
-                              deletePromise
+                              ua.deleteBackup(backup.name)
                                 .then(() => {
                                   setBackupMessage(t('home.deletedBackup', { name: backup.name }));
                                   refreshBackups();
@@ -594,9 +823,19 @@ export function Home({
       {/* Upgrade Dialog */}
       <UpgradeDialog
         open={showUpgradeDialog}
-        onOpenChange={setShowUpgradeDialog}
-        isRemote={isRemote}
-        instanceId={instanceId}
+        onOpenChange={(open) => {
+          setShowUpgradeDialog(open);
+          if (!open) {
+            // Refresh version + update status after closing upgrade dialog
+            fetchStatus();
+            fetchStatusExtra();
+            ua.checkOpenclawUpdate()
+              .then((u) => setUpdateInfo({ available: u.upgradeAvailable, latest: u.latestVersion ?? undefined }))
+              .catch(() => {});
+          }
+        }}
+        isRemote={ua.isRemote}
+        instanceId={ua.instanceId}
         currentVersion={version || ""}
         latestVersion={updateInfo?.latest || ""}
       />

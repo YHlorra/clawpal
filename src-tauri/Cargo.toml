@@ -1,6 +1,6 @@
 [package]
 name = "clawpal"
-version = "0.1.4"
+version = "0.3.2"
 edition = "2021"
 
 [lib]
@@ -18,14 +18,25 @@ tauri = { version = "2.1.0", features = [] }
 thiserror = "1.0.63"
 uuid = { version = "1.11.0", features = ["v4"] }
 chrono = { version = "0.4.38", features = ["clock"] }
-russh = "0.46"
-russh-keys = "0.46"
-russh-sftp = "2.0"
-async-trait = "0.1"
-tokio = { version = "1", features = ["sync"] }
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+tokio = { version = "1", features = ["sync", "process", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 shellexpand = "3.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+hostname = "0.4"
+indexmap = "2"
+portpicker = "0.1.1"
+
+[target.'cfg(unix)'.dependencies]
+openssh = { version = "0.11", features = ["process-mux"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 [build-dependencies]
 tauri-build = { version = "2.1.0", features = [] }

@@ -4,8 +4,9 @@ import { useTranslation } from "react-i18next";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { api } from "@/lib/api";
-import { useInstance } from "@/lib/instance-context";
+import { toast } from "sonner";
+import { useApi } from "@/lib/use-api";
+import { useTheme } from "@/lib/use-theme";
 import type { ModelCatalogProvider, ModelProfile, ProviderAuthSuggestion, ResolvedApiKey } from "@/lib/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -20,6 +21,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -131,13 +139,16 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
   onAppUpdateSeen?: () => void;
 }) {
   const { t, i18n } = useTranslation();
-  const { instanceId, isRemote, isConnected } = useInstance();
+  const ua = useApi();
+  const { theme, setTheme } = useTheme();
   const [profiles, setProfiles] = useState<ModelProfile[] | null>(null);
   const [catalog, setCatalog] = useState<ModelCatalogProvider[]>([]);
   const [apiKeys, setApiKeys] = useState<ResolvedApiKey[]>([]);
   const [form, setForm] = useState<ProfileForm>(emptyForm());
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [authSuggestion, setAuthSuggestion] = useState<ProviderAuthSuggestion | null>(null);
+  const [testingProfileId, setTestingProfileId] = useState<string | null>(null);
 
   const [catalogRefreshed, setCatalogRefreshed] = useState(false);
 
@@ -201,55 +212,34 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       handleCheckForUpdates();
       onAppUpdateSeen?.();
     }
-  }, [hasAppUpdate]);
+  }, [hasAppUpdate, handleCheckForUpdates, onAppUpdateSeen]);
 
-  // Extract profiles from remote config on first load
+  // Extract profiles from config on first load
   useEffect(() => {
-    if (!isRemote || !isConnected) return;
-    api.remoteExtractModelProfilesFromConfig(instanceId)
-      .catch((e) => console.error("Failed to extract remote profiles:", e));
-  }, [isRemote, isConnected, instanceId]);
+    ua.extractModelProfilesFromConfig()
+      .catch((e) => console.error("Failed to extract profiles:", e));
+  }, [ua]);
 
   const refreshProfiles = () => {
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteListModelProfiles(instanceId).then(setProfiles).catch((e) => console.error("Failed to load remote profiles:", e));
-      api.remoteResolveApiKeys(instanceId).then(setApiKeys).catch((e) => console.error("Failed to resolve remote API keys:", e));
-    } else {
-      api.listModelProfiles().then(setProfiles).catch((e) => console.error("Failed to load profiles:", e));
-      api.resolveApiKeys().then(setApiKeys).catch((e) => console.error("Failed to resolve API keys:", e));
-    }
+    ua.listModelProfiles().then(setProfiles).catch((e) => console.error("Failed to load profiles:", e));
+    ua.resolveApiKeys().then(setApiKeys).catch((e) => console.error("Failed to resolve API keys:", e));
   };
 
-  useEffect(refreshProfiles, [isRemote, isConnected, instanceId]);
+  useEffect(refreshProfiles, [ua]);
 
-  // Load catalog from cache instantly (no CLI calls)
+  // Load catalog on mount
   useEffect(() => {
     setCatalogRefreshed(false);
-    if (isRemote) {
-      // For remote, load catalog on mount (no local cache)
-      if (isConnected) {
-        api.remoteRefreshModelCatalog(instanceId).then(setCatalog).catch((e) => console.error("Failed to load remote model catalog:", e));
-      }
-    } else {
-      api.getCachedModelCatalog().then(setCatalog).catch((e) => console.error("Failed to load model catalog:", e));
-    }
-  }, [isRemote, isConnected, instanceId]);
+    ua.refreshModelCatalog().then(setCatalog).catch((e) => console.error("Failed to load model catalog:", e));
+  }, [ua]);
 
   // Refresh catalog from CLI when user focuses provider/model input
   const ensureCatalog = () => {
     if (catalogRefreshed) return;
     setCatalogRefreshed(true);
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteRefreshModelCatalog(instanceId).then((fresh) => {
-        if (fresh.length > 0) setCatalog(fresh);
-      }).catch((e) => console.error("Failed to refresh remote model catalog:", e));
-    } else {
-      api.refreshModelCatalog().then((fresh) => {
-        if (fresh.length > 0) setCatalog(fresh);
-      }).catch((e) => console.error("Failed to refresh model catalog:", e));
-    }
+    ua.refreshModelCatalog().then((fresh) => {
+      if (fresh.length > 0) setCatalog(fresh);
+    }).catch((e) => console.error("Failed to refresh model catalog:", e));
   };
 
   const maskedKeyMap = useMemo(() => {
@@ -266,26 +256,26 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       setAuthSuggestion(null);
       return;
     }
-    if (isRemote) {
-      // For remote: check if any existing profile with the same provider already has a key
-      const sameProviderProfile = (profiles || []).find(
+    if (ua.isRemote) {
+      // For remote: infer from existing profiles
+      const existing = (profiles || []).find(
         (p) => p.provider === form.provider && maskedKeyMap.has(p.id) && maskedKeyMap.get(p.id) !== "..."
       );
-      if (sameProviderProfile) {
+      if (existing) {
         setAuthSuggestion({
           hasKey: true,
-          source: `existing profile (${sameProviderProfile.provider}/${sameProviderProfile.model})`,
-          authRef: sameProviderProfile.authRef || "",
+          source: `existing profile (${existing.provider}/${existing.model})`,
+          authRef: existing.authRef || "",
         });
       } else {
         setAuthSuggestion(null);
       }
     } else {
-      api.resolveProviderAuth(form.provider)
+      ua.resolveProviderAuth(form.provider)
         .then(setAuthSuggestion)
         .catch((e) => { console.error("Failed to resolve provider auth:", e); setAuthSuggestion(null); });
     }
-  }, [form.provider, form.id, isRemote, profiles, maskedKeyMap]);
+  }, [form.provider, form.id, ua, profiles, maskedKeyMap]);
 
   const modelCandidates = useMemo(() => {
     const found = catalog.find((c) => c.provider === form.provider);
@@ -298,7 +288,7 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       setMessage(t('settings.providerModelRequired'));
       return;
     }
-    if (!isRemote && !form.apiKey && !form.id && !authSuggestion?.hasKey) {
+    if (!ua.isRemote && !form.apiKey && !form.id && !authSuggestion?.hasKey) {
       setMessage(t('settings.apiKeyRequired'));
       return;
     }
@@ -312,13 +302,11 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       baseUrl: form.useCustomUrl && form.baseUrl ? form.baseUrl : undefined,
       enabled: form.enabled,
     };
-    const upsertPromise = isRemote
-      ? api.remoteUpsertModelProfile(instanceId, profileData)
-      : api.upsertModelProfile(profileData);
-    upsertPromise
+    ua.upsertModelProfile(profileData)
       .then(() => {
         setMessage(t('settings.profileSaved'));
         setForm(emptyForm());
+        setProfileDialogOpen(false);
         refreshProfiles();
         onDataChange?.();
       })
@@ -335,13 +323,16 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       baseUrl: profile.baseUrl || "",
       enabled: profile.enabled,
     });
+    setProfileDialogOpen(true);
+  };
+
+  const openAddProfile = () => {
+    setForm(emptyForm());
+    setProfileDialogOpen(true);
   };
 
   const deleteProfile = (id: string) => {
-    const deletePromise = isRemote
-      ? api.remoteDeleteModelProfile(instanceId, id)
-      : api.deleteModelProfile(id);
-    deletePromise
+    ua.deleteModelProfile(id)
       .then(() => {
         setMessage(t('settings.profileDeleted'));
         if (form.id === id) {
@@ -353,12 +344,50 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       .catch((e) => setMessage(t('settings.deleteFailed', { error: String(e) })));
   };
 
+  const toggleProfileEnabled = (profile: ModelProfile) => {
+    const nextEnabled = !profile.enabled;
+    ua.upsertModelProfile({
+      ...profile,
+      enabled: nextEnabled,
+    })
+      .then(() => {
+        const message = nextEnabled
+          ? t('settings.profileEnabledMessage', { name: `${profile.provider}/${profile.model}` })
+          : t('settings.profileDisabledMessage', { name: `${profile.provider}/${profile.model}` });
+        toast.success(message);
+        refreshProfiles();
+        onDataChange?.();
+      })
+      .catch((e) => {
+        const errorText = e instanceof Error ? e.message : String(e);
+        toast.error(t('settings.saveFailed', { error: errorText }));
+      });
+  };
+
+  const testProfile = async (profile: ModelProfile) => {
+    setTestingProfileId(profile.id);
+    try {
+      await ua.testModelProfile(profile.id);
+
+      toast.success(
+        t('settings.testProfileSuccess', {
+          name: `${profile.provider}/${profile.model}`,
+        }),
+      );
+    } catch (e) {
+      const errorText = e instanceof Error ? e.message : String(e);
+      toast.error(t('settings.testProfileFailed', { error: errorText }));
+    } finally {
+      setTestingProfileId(null);
+    }
+  };
+
   return (
     <section>
       <h2 className="text-2xl font-bold mb-4">{t('settings.title')}</h2>
 
       {/* ---- Model Profiles ---- */}
-      {!isRemote && (
+      {!ua.isRemote && (
         <p className="text-sm text-muted-foreground mb-4">
           {t('settings.oauthHint')}
           <code className="mx-1 px-1.5 py-0.5 bg-muted rounded text-xs">openclaw models auth login</code>
@@ -368,149 +397,27 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
         </p>
       )}
 
-          <div className="grid grid-cols-2 gap-3 items-start">
-            <div className="space-y-3">
-            {/* Create / Edit form */}
+          <div className="space-y-3">
+            {/* Preferences: Version, Language, Theme */}
             <Card>
-              <CardHeader>
-                <CardTitle>{form.id ? t('settings.editProfile') : t('settings.addProfile')}</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <form onSubmit={upsert} className="space-y-4">
-                  <div className="space-y-1.5">
-                    <Label>{t('settings.provider')}</Label>
-                    <AutocompleteField
-                      value={form.provider}
-                      onChange={(val) =>
-                        setForm((p) => ({ ...p, provider: val, model: "" }))
-                      }
-                      onFocus={ensureCatalog}
-                      options={catalog.map((c) => ({
-                        value: c.provider,
-                        label: c.provider,
-                      }))}
-                      placeholder="e.g. openai"
-                    />
+              <CardContent className="space-y-4">
+                {/* Version */}
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <Label className="text-sm font-semibold">{t('settings.currentVersion')}</Label>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-medium">{appVersion ? `v${appVersion}` : "..."}</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCheckForUpdates}
+                      disabled={appUpdateChecking || appUpdating}
+                    >
+                      {appUpdateChecking ? t('settings.checkingUpdates') : t('settings.checkForUpdates')}
+                    </Button>
                   </div>
-
-                  <div className="space-y-1.5">
-                    <Label>{t('settings.model')}</Label>
-                    <AutocompleteField
-                      value={form.model}
-                      onChange={(val) =>
-                        setForm((p) => ({ ...p, model: val }))
-                      }
-                      onFocus={ensureCatalog}
-                      options={modelCandidates.map((m) => ({
-                        value: m.id,
-                        label: m.name || m.id,
-                      }))}
-                      placeholder="e.g. gpt-4o"
-                    />
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label>{t('settings.apiKey')}</Label>
-                    <Input
-                      type="password"
-                      placeholder={form.id ? t('settings.apiKeyUnchanged') : authSuggestion?.hasKey ? t('settings.apiKeyOptional') : t('settings.apiKeyPlaceholder')}
-                      value={form.apiKey}
-                      onChange={(e) =>
-                        setForm((p) => ({ ...p, apiKey: e.target.value }))
-                      }
-                    />
-                    {!form.id && authSuggestion?.hasKey && (
-                      <p className="text-xs text-muted-foreground">
-                        {t('settings.keyAvailable', { source: authSuggestion.source })}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="custom-url"
-                      checked={form.useCustomUrl}
-                      onCheckedChange={(checked) =>
-                        setForm((p) => ({ ...p, useCustomUrl: checked === true }))
-                      }
-                    />
-                    <Label htmlFor="custom-url">{t('settings.customBaseUrl')}</Label>
-                  </div>
-
-                  {form.useCustomUrl && (
-                    <div className="space-y-1.5">
-                      <Label>{t('settings.baseUrl')}</Label>
-                      <Input
-                        placeholder="e.g. https://api.openai.com/v1"
-                        value={form.baseUrl}
-                        onChange={(e) =>
-                          setForm((p) => ({ ...p, baseUrl: e.target.value }))
-                        }
-                      />
-                    </div>
-                  )}
-
-                  <div className="flex gap-2 mt-2">
-                    <Button type="submit">{t('settings.save')}</Button>
-                    {form.id && (
-                      <>
-                        <AlertDialog>
-                          <AlertDialogTrigger asChild>
-                            <Button type="button" variant="destructive">
-                              {t('settings.delete')}
-                            </Button>
-                          </AlertDialogTrigger>
-                          <AlertDialogContent>
-                            <AlertDialogHeader>
-                              <AlertDialogTitle>{t('settings.deleteProfileTitle')}</AlertDialogTitle>
-                              <AlertDialogDescription>
-                                {t('settings.deleteProfileDescription', { name: `${form.provider}/${form.model}` })}
-                              </AlertDialogDescription>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                              <AlertDialogCancel>{t('settings.cancel')}</AlertDialogCancel>
-                              <AlertDialogAction
-                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                                onClick={() => deleteProfile(form.id)}
-                              >
-                                {t('settings.delete')}
-                              </AlertDialogAction>
-                            </AlertDialogFooter>
-                          </AlertDialogContent>
-                        </AlertDialog>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={() => setForm(emptyForm())}
-                        >
-                          {t('settings.cancel')}
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </form>
-              </CardContent>
-            </Card>
-
-            {/* Current Version */}
-            <Card>
-              <CardHeader>
-                <CardTitle>{t('settings.currentVersion')}</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-center gap-3 flex-wrap">
-                  <span className="text-sm font-medium">{appVersion ? `v${appVersion}` : "..."}</span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleCheckForUpdates}
-                    disabled={appUpdateChecking || appUpdating}
-                  >
-                    {appUpdateChecking ? t('settings.checkingUpdates') : t('settings.checkForUpdates')}
-                  </Button>
                 </div>
                 {!appUpdateChecking && appUpdate && !appUpdating && (
-                  <div className="flex items-center gap-2 mt-3">
+                  <div className="flex items-center gap-2">
                     <Badge variant="outline" className="text-primary border-primary">
                       {t('settings.updateAvailable', { version: appUpdate.version })}
                     </Badge>
@@ -520,7 +427,7 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
                   </div>
                 )}
                 {appUpdating && (
-                  <div className="flex items-center gap-2 mt-3">
+                  <div className="flex items-center gap-2">
                     <Badge variant="outline" className="text-muted-foreground">
                       {appUpdateProgress !== null && appUpdateProgress < 100
                         ? t('settings.downloading', { progress: appUpdateProgress })
@@ -538,36 +445,50 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
                     )}
                   </div>
                 )}
-              </CardContent>
-            </Card>
 
-            {/* Language Selector */}
-            <Card>
-              <CardHeader>
-                <CardTitle>{t('settings.language')}</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground mb-3">{t('settings.languageDescription')}</p>
-                <Select
-                  value={i18n.language?.startsWith('zh') ? 'zh' : 'en'}
-                  onValueChange={(val) => i18n.changeLanguage(val)}
-                >
-                  <SelectTrigger className="w-[200px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="en">English</SelectItem>
-                    <SelectItem value="zh">简体中文</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="h-px bg-border" />
+
+                {/* Language & Theme */}
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex items-center gap-3">
+                    <Label className="text-sm font-semibold shrink-0">{t('settings.language')}</Label>
+                    <Select
+                      value={i18n.language?.startsWith('zh') ? 'zh' : 'en'}
+                      onValueChange={(val) => i18n.changeLanguage(val)}
+                    >
+                      <SelectTrigger className="w-[140px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="en">English</SelectItem>
+                        <SelectItem value="zh">简体中文</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Label className="text-sm font-semibold shrink-0">{t('settings.theme')}</Label>
+                    <Select value={theme} onValueChange={setTheme}>
+                      <SelectTrigger className="w-[140px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="light">{t('settings.themeLight')}</SelectItem>
+                        <SelectItem value="dark">{t('settings.themeDark')}</SelectItem>
+                        <SelectItem value="system">{t('settings.themeSystem')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
               </CardContent>
             </Card>
-            </div>
 
             {/* Profiles list */}
             <Card>
               <CardHeader>
-                <CardTitle>{t('settings.modelProfiles')}</CardTitle>
+                <div className="flex items-center justify-between">
+                  <CardTitle>{t('settings.modelProfiles')}</CardTitle>
+                  <Button size="sm" onClick={openAddProfile}>{t('settings.addProfile')}</Button>
+                </div>
               </CardHeader>
               <CardContent>
                 {profiles === null ? (
@@ -584,11 +505,11 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
                       <div className="flex justify-between items-center">
                         <strong>{profile.provider}/{profile.model}</strong>
                         {profile.enabled ? (
-                          <Badge className="bg-blue-100 text-blue-700 border-0">
+                          <Badge className="bg-blue-500/10 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400">
                             {t('settings.enabled')}
                           </Badge>
                         ) : (
-                          <Badge className="bg-red-100 text-red-700 border-0">
+                          <Badge className="bg-red-500/10 text-red-600 dark:bg-red-500/15 dark:text-red-400">
                             {t('settings.disabled')}
                           </Badge>
                         )}
@@ -602,6 +523,23 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
                         </div>
                       )}
                       <div className="flex gap-1.5 mt-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          type="button"
+                          onClick={() => testProfile(profile)}
+                          disabled={testingProfileId === profile.id}
+                        >
+                          {testingProfileId === profile.id ? t('settings.testing') : t('settings.test')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          type="button"
+                          onClick={() => toggleProfileEnabled(profile)}
+                        >
+                          {profile.enabled ? t('settings.disable') : t('settings.enable')}
+                        </Button>
                         <Button
                           size="sm"
                           variant="outline"
@@ -645,6 +583,136 @@ export function Settings({ onDataChange, hasAppUpdate, onAppUpdateSeen }: {
       {message && (
         <p className="text-sm text-muted-foreground mt-3">{message}</p>
       )}
+
+      {/* Add / Edit Profile Dialog */}
+      <Dialog open={profileDialogOpen} onOpenChange={(open) => {
+        setProfileDialogOpen(open);
+        if (!open) setForm(emptyForm());
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{form.id ? t('settings.editProfile') : t('settings.addProfile')}</DialogTitle>
+          </DialogHeader>
+          <form onSubmit={upsert} className="space-y-4">
+            <div className="space-y-1.5">
+              <Label>{t('settings.provider')}</Label>
+              <AutocompleteField
+                value={form.provider}
+                onChange={(val) =>
+                  setForm((p) => ({ ...p, provider: val, model: "" }))
+                }
+                onFocus={ensureCatalog}
+                options={catalog.map((c) => ({
+                  value: c.provider,
+                  label: c.provider,
+                }))}
+                placeholder="e.g. openai"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label>{t('settings.model')}</Label>
+              <AutocompleteField
+                value={form.model}
+                onChange={(val) =>
+                  setForm((p) => ({ ...p, model: val }))
+                }
+                onFocus={ensureCatalog}
+                options={modelCandidates.map((m) => ({
+                  value: m.id,
+                  label: m.name || m.id,
+                }))}
+                placeholder="e.g. gpt-4o"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label>{t('settings.apiKey')}</Label>
+              <Input
+                type="password"
+                placeholder={form.id ? t('settings.apiKeyUnchanged') : authSuggestion?.hasKey ? t('settings.apiKeyOptional') : t('settings.apiKeyPlaceholder')}
+                value={form.apiKey}
+                onChange={(e) =>
+                  setForm((p) => ({ ...p, apiKey: e.target.value }))
+                }
+              />
+              {!form.id && authSuggestion?.hasKey && (
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.keyAvailable', { source: authSuggestion.source })}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="custom-url"
+                checked={form.useCustomUrl}
+                onCheckedChange={(checked) =>
+                  setForm((p) => ({ ...p, useCustomUrl: checked === true }))
+                }
+              />
+              <Label htmlFor="custom-url">{t('settings.customBaseUrl')}</Label>
+            </div>
+
+            {form.useCustomUrl && (
+              <div className="space-y-1.5">
+                <Label>{t('settings.baseUrl')}</Label>
+                <Input
+                  placeholder="e.g. https://api.openai.com/v1"
+                  value={form.baseUrl}
+                  onChange={(e) =>
+                    setForm((p) => ({ ...p, baseUrl: e.target.value }))
+                  }
+                />
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="profile-enabled"
+                checked={form.enabled}
+                onCheckedChange={(checked) =>
+                  setForm((p) => ({ ...p, enabled: checked === true }))
+                }
+              />
+              <Label htmlFor="profile-enabled">{t('settings.profileEnabled')}</Label>
+            </div>
+
+            <DialogFooter>
+              {form.id && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button type="button" variant="destructive" className="mr-auto">
+                      {t('settings.delete')}
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>{t('settings.deleteProfileTitle')}</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        {t('settings.deleteProfileDescription', { name: `${form.provider}/${form.model}` })}
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>{t('settings.cancel')}</AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        onClick={() => { deleteProfile(form.id); setProfileDialogOpen(false); }}
+                      >
+                        {t('settings.delete')}
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
+              <Button type="button" variant="outline" onClick={() => setProfileDialogOpen(false)}>
+                {t('settings.cancel')}
+              </Button>
+              <Button type="submit">{t('settings.save')}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
     </section>
   );

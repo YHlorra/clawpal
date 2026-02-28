@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentOverview, AgentSessionAnalysis, ApplyResult, BackupInfo, Binding, ChannelNode, ConfigDirtyState, DiscordGuildChannel, HistoryItem, ModelCatalogProvider, ModelProfile, PreviewResult, ProviderAuthSuggestion, Recipe, RemoteSystemStatus, ResolvedApiKey, StatusLight, SystemStatus, DoctorReport, MemoryFile, SessionFile, SshHost, SshExecResult, SftpEntry } from "./types";
+import type { AgentOverview, AgentSessionAnalysis, ApplyQueueResult, ApplyResult, BackupInfo, Binding, ChannelNode, CronJob, CronRun, DiscordGuildChannel, GatewayCredentials, HistoryItem, InstanceStatus, StatusExtra, ModelCatalogProvider, ModelProfile, PendingCommand, PreviewQueueResult, PreviewResult, ProviderAuthSuggestion, Recipe, RescueBotAction, RescueBotManageResult, RescuePrimaryDiagnosisResult, RescuePrimaryRepairResult, ResolvedApiKey, SshConfigHostSuggestion, SystemStatus, DoctorReport, SessionFile, SshHost, WatchdogStatus } from "./types";
 
 export const api = {
   getSystemStatus: (): Promise<SystemStatus> =>
     invoke("get_system_status", {}),
-  getStatusLight: (): Promise<StatusLight> =>
+  getInstanceStatus: (): Promise<InstanceStatus> =>
     invoke("get_status_light", {}),
+  getStatusExtra: (): Promise<StatusExtra> =>
+    invoke("get_status_extra", {}),
   getCachedModelCatalog: (): Promise<ModelCatalogProvider[]> =>
     invoke("get_cached_model_catalog", {}),
   refreshModelCatalog: (): Promise<ModelCatalogProvider[]> =>
@@ -22,42 +24,30 @@ export const api = {
     invoke("rollback", { snapshotId }),
   listModelProfiles: (): Promise<ModelProfile[]> =>
     invoke("list_model_profiles", {}),
-  listModelCatalog: (): Promise<ModelCatalogProvider[]> =>
-    invoke("list_model_catalog", {}),
   extractModelProfilesFromConfig: (): Promise<{ created: number; reused: number; skippedInvalid: number }> =>
     invoke("extract_model_profiles_from_config", {}),
   upsertModelProfile: (profile: ModelProfile): Promise<ModelProfile> =>
     invoke("upsert_model_profile", { profile }),
   deleteModelProfile: (profileId: string): Promise<boolean> =>
-    invoke("delete_model_profile", { profile_id: profileId }),
+    invoke("delete_model_profile", { profileId }),
+  testModelProfile: (profileId: string): Promise<boolean> =>
+    invoke("test_model_profile", { profileId }),
   resolveProviderAuth: (provider: string): Promise<ProviderAuthSuggestion> =>
     invoke("resolve_provider_auth", { provider }),
   resolveApiKeys: (): Promise<ResolvedApiKey[]> =>
     invoke("resolve_api_keys", {}),
-  listAgentIds: (): Promise<string[]> =>
-    invoke("list_agent_ids", {}),
   listAgentsOverview: (): Promise<AgentOverview[]> =>
     invoke("list_agents_overview", {}),
-  createAgent: (agentId: string, modelProfileId?: string, independent?: boolean): Promise<AgentOverview> =>
-    invoke("create_agent", { agentId, modelProfileId, independent }),
+  createAgent: (agentId: string, modelValue?: string, independent?: boolean): Promise<AgentOverview> =>
+    invoke("create_agent", { agentId, modelValue, independent }),
   deleteAgent: (agentId: string): Promise<boolean> =>
     invoke("delete_agent", { agentId }),
   setupAgentIdentity: (agentId: string, name: string, emoji?: string): Promise<boolean> =>
     invoke("setup_agent_identity", { agentId, name, emoji }),
-  listMemoryFiles: (): Promise<MemoryFile[]> =>
-    invoke("list_memory_files", {}),
-  deleteMemoryFile: (filePath: string): Promise<boolean> =>
-    invoke("delete_memory_file", { path: filePath }),
-  clearMemory: (): Promise<number> =>
-    invoke("clear_memory", {}),
   listSessionFiles: (): Promise<SessionFile[]> =>
     invoke("list_session_files", {}),
-  deleteSessionFile: (filePath: string): Promise<boolean> =>
-    invoke("delete_session_file", { path: filePath }),
   clearAllSessions: (): Promise<number> =>
     invoke("clear_all_sessions", {}),
-  clearAgentSessions: (agentId: string): Promise<number> =>
-    invoke("clear_agent_sessions", { agentId }),
   analyzeSessions: (): Promise<AgentSessionAnalysis[]> =>
     invoke("analyze_sessions", {}),
   deleteSessionsByIds: (agentId: string, sessionIds: string[]): Promise<number> =>
@@ -70,8 +60,6 @@ export const api = {
     invoke("fix_issues", { ids }),
   readRawConfig: (): Promise<string> =>
     invoke("read_raw_config", {}),
-  resolveFullApiKey: (profileId: string): Promise<string> =>
-    invoke("resolve_full_api_key", { profileId }),
   openUrl: (url: string): Promise<void> =>
     invoke("open_url", { url }),
   chatViaOpenclaw: (agentId: string, message: string, sessionId?: string): Promise<Record<string, unknown>> =>
@@ -92,26 +80,23 @@ export const api = {
     invoke("refresh_discord_guild_channels", {}),
   restartGateway: (): Promise<boolean> =>
     invoke("restart_gateway", {}),
-  setGlobalModel: (profileId: string | null): Promise<boolean> =>
-    invoke("set_global_model", { profileId }),
-  setAgentModel: (agentId: string, profileId: string | null): Promise<boolean> =>
-    invoke("set_agent_model", { agentId, profileId }),
+  manageRescueBot: (action: RescueBotAction, profile?: string, rescuePort?: number): Promise<RescueBotManageResult> =>
+    invoke("manage_rescue_bot", { action, profile: profile ?? null, rescuePort: rescuePort ?? null }),
+  diagnosePrimaryViaRescue: (targetProfile?: string, rescueProfile?: string): Promise<RescuePrimaryDiagnosisResult> =>
+    invoke("diagnose_primary_via_rescue", { targetProfile: targetProfile ?? null, rescueProfile: rescueProfile ?? null }),
+  repairPrimaryViaRescue: (targetProfile?: string, rescueProfile?: string, issueIds?: string[]): Promise<RescuePrimaryRepairResult> =>
+    invoke("repair_primary_via_rescue", { targetProfile: targetProfile ?? null, rescueProfile: rescueProfile ?? null, issueIds: issueIds ?? null }),
+  setGlobalModel: (modelValue: string | null): Promise<boolean> =>
+    invoke("set_global_model", { modelValue }),
+  setAgentModel: (agentId: string, modelValue: string | null): Promise<boolean> =>
+    invoke("set_agent_model", { agentId, modelValue }),
   listBindings: (): Promise<Binding[]> =>
     invoke("list_bindings", {}),
-  assignChannelAgent: (channelType: string, peerId: string, agentId: string | null): Promise<boolean> =>
-    invoke("assign_channel_agent", { channelType, peerId, agentId }),
-  saveConfigBaseline: (): Promise<boolean> =>
-    invoke("save_config_baseline", {}),
-  checkConfigDirty: (): Promise<ConfigDirtyState> =>
-    invoke("check_config_dirty", {}),
-  discardConfigChanges: (): Promise<boolean> =>
-    invoke("discard_config_changes", {}),
-  applyPendingChanges: (): Promise<boolean> =>
-    invoke("apply_pending_changes", {}),
-
   // SSH host management
   listSshHosts: (): Promise<SshHost[]> =>
     invoke("list_ssh_hosts", {}),
+  listSshConfigHosts: (): Promise<SshConfigHostSuggestion[]> =>
+    invoke("list_ssh_config_hosts", {}),
   upsertSshHost: (host: SshHost): Promise<SshHost> =>
     invoke("upsert_ssh_host", { host }),
   deleteSshHost: (hostId: string): Promise<boolean> =>
@@ -120,28 +105,20 @@ export const api = {
   // SSH connection
   sshConnect: (hostId: string): Promise<boolean> =>
     invoke("ssh_connect", { hostId }),
+  sshConnectWithPassphrase: (hostId: string, passphrase: string): Promise<boolean> =>
+    invoke("ssh_connect_with_passphrase", { hostId, passphrase }),
   sshDisconnect: (hostId: string): Promise<boolean> =>
     invoke("ssh_disconnect", { hostId }),
   sshStatus: (hostId: string): Promise<string> =>
     invoke("ssh_status", { hostId }),
 
-  // SSH primitives
-  sshExec: (hostId: string, command: string): Promise<SshExecResult> =>
-    invoke("ssh_exec", { hostId, command }),
-  sftpReadFile: (hostId: string, path: string): Promise<string> =>
-    invoke("sftp_read_file", { hostId, path }),
-  sftpWriteFile: (hostId: string, path: string, content: string): Promise<boolean> =>
-    invoke("sftp_write_file", { hostId, path, content }),
-  sftpListDir: (hostId: string, path: string): Promise<SftpEntry[]> =>
-    invoke("sftp_list_dir", { hostId, path }),
-  sftpRemoveFile: (hostId: string, path: string): Promise<boolean> =>
-    invoke("sftp_remove_file", { hostId, path }),
-
   // Remote business commands
   remoteReadRawConfig: (hostId: string): Promise<string> =>
     invoke("remote_read_raw_config", { hostId }),
-  remoteGetSystemStatus: (hostId: string): Promise<RemoteSystemStatus> =>
+  remoteGetInstanceStatus: (hostId: string): Promise<InstanceStatus> =>
     invoke("remote_get_system_status", { hostId }),
+  remoteGetStatusExtra: (hostId: string): Promise<StatusExtra> =>
+    invoke("remote_get_status_extra", { hostId }),
   remoteListAgentsOverview: (hostId: string): Promise<AgentOverview[]> =>
     invoke("remote_list_agents_overview", { hostId }),
   remoteListChannelsMinimal: (hostId: string): Promise<ChannelNode[]> =>
@@ -150,22 +127,22 @@ export const api = {
     invoke("remote_list_bindings", { hostId }),
   remoteRestartGateway: (hostId: string): Promise<boolean> =>
     invoke("remote_restart_gateway", { hostId }),
+  remoteManageRescueBot: (hostId: string, action: RescueBotAction, profile?: string, rescuePort?: number): Promise<RescueBotManageResult> =>
+    invoke("remote_manage_rescue_bot", { hostId, action, profile: profile ?? null, rescuePort: rescuePort ?? null }),
+  remoteDiagnosePrimaryViaRescue: (hostId: string, targetProfile?: string, rescueProfile?: string): Promise<RescuePrimaryDiagnosisResult> =>
+    invoke("remote_diagnose_primary_via_rescue", { hostId, targetProfile: targetProfile ?? null, rescueProfile: rescueProfile ?? null }),
+  remoteRepairPrimaryViaRescue: (hostId: string, targetProfile?: string, rescueProfile?: string, issueIds?: string[]): Promise<RescuePrimaryRepairResult> =>
+    invoke("remote_repair_primary_via_rescue", { hostId, targetProfile: targetProfile ?? null, rescueProfile: rescueProfile ?? null, issueIds: issueIds ?? null }),
   remoteApplyConfigPatch: (hostId: string, patchTemplate: string, params: Record<string, string>): Promise<ApplyResult> =>
     invoke("remote_apply_config_patch", { hostId, patchTemplate, params }),
-  remoteCreateAgent: (hostId: string, agentId: string, model?: string): Promise<AgentOverview> =>
-    invoke("remote_create_agent", { hostId, agentId, model }),
-  remoteDeleteAgent: (hostId: string, agentId: string): Promise<boolean> =>
-    invoke("remote_delete_agent", { hostId, agentId }),
-  remoteAssignChannelAgent: (hostId: string, channelType: string, peerId: string, agentId: string | null): Promise<boolean> =>
-    invoke("remote_assign_channel_agent", { hostId, channelType, peerId, agentId }),
-  remoteSetGlobalModel: (hostId: string, modelValue: string | null): Promise<boolean> =>
-    invoke("remote_set_global_model", { hostId, modelValue }),
-  remoteSetAgentModel: (hostId: string, agentId: string, modelValue: string | null): Promise<boolean> =>
-    invoke("remote_set_agent_model", { hostId, agentId, modelValue }),
   remoteListDiscordGuildChannels: (hostId: string): Promise<DiscordGuildChannel[]> =>
     invoke("remote_list_discord_guild_channels", { hostId }),
   remoteRunDoctor: (hostId: string): Promise<DoctorReport> =>
     invoke("remote_run_doctor", { hostId }),
+  remoteFixIssues: (hostId: string, ids: string[]): Promise<{ ok: boolean; applied: string[]; remainingIssues: string[] }> =>
+    invoke("remote_fix_issues", { hostId, ids }),
+  remoteSetupAgentIdentity: (hostId: string, agentId: string, name: string, emoji?: string): Promise<boolean> =>
+    invoke("remote_setup_agent_identity", { hostId, agentId, name, emoji }),
   remoteListHistory: (hostId: string): Promise<{ items: HistoryItem[] }> =>
     invoke("remote_list_history", { hostId }),
   remotePreviewRollback: (hostId: string, snapshotId: string): Promise<PreviewResult> =>
@@ -190,6 +167,8 @@ export const api = {
     invoke("remote_upsert_model_profile", { hostId, profile }),
   remoteDeleteModelProfile: (hostId: string, profileId: string): Promise<boolean> =>
     invoke("remote_delete_model_profile", { hostId, profileId }),
+  remoteTestModelProfile: (hostId: string, profileId: string): Promise<boolean> =>
+    invoke("remote_test_model_profile", { hostId, profileId }),
   remoteResolveApiKeys: (hostId: string): Promise<ResolvedApiKey[]> =>
     invoke("remote_resolve_api_keys", { hostId }),
   remoteExtractModelProfilesFromConfig: (hostId: string): Promise<{ created: number; reused: number; skippedInvalid: number }> =>
@@ -200,15 +179,6 @@ export const api = {
     invoke("remote_chat_via_openclaw", { hostId, agentId, message, sessionId }),
   remoteCheckOpenclawUpdate: (hostId: string): Promise<{ upgradeAvailable: boolean; latestVersion: string | null; installedVersion: string }> =>
     invoke("remote_check_openclaw_update", { hostId }),
-  remoteSaveConfigBaseline: (hostId: string): Promise<boolean> =>
-    invoke("remote_save_config_baseline", { hostId }),
-  remoteCheckConfigDirty: (hostId: string): Promise<ConfigDirtyState> =>
-    invoke("remote_check_config_dirty", { hostId }),
-  remoteDiscardConfigChanges: (hostId: string): Promise<boolean> =>
-    invoke("remote_discard_config_changes", { hostId }),
-  remoteApplyPendingChanges: (hostId: string): Promise<boolean> =>
-    invoke("remote_apply_pending_changes", { hostId }),
-
   // Remote backup
   remoteBackupBeforeUpgrade: (hostId: string): Promise<BackupInfo> =>
     invoke("remote_backup_before_upgrade", { hostId }),
@@ -220,8 +190,134 @@ export const api = {
     invoke("remote_delete_backup", { hostId, backupName }),
 
   // Upgrade
+  checkOpenclawUpdate: (): Promise<{ upgradeAvailable: boolean; latestVersion: string | null; installedVersion: string }> =>
+    invoke("check_openclaw_update"),
   runOpenclawUpgrade: (): Promise<string> =>
     invoke("run_openclaw_upgrade", {}),
   remoteRunOpenclawUpgrade: (hostId: string): Promise<string> =>
     invoke("remote_run_openclaw_upgrade", { hostId }),
+
+  // Cron
+  listCronJobs: (): Promise<CronJob[]> =>
+    invoke("list_cron_jobs", {}),
+  getCronRuns: (jobId: string, limit?: number): Promise<CronRun[]> =>
+    invoke("get_cron_runs", { jobId, limit }),
+  triggerCronJob: (jobId: string): Promise<string> =>
+    invoke("trigger_cron_job", { jobId }),
+  deleteCronJob: (jobId: string): Promise<string> =>
+    invoke("delete_cron_job", { jobId }),
+
+  // Watchdog
+  getWatchdogStatus: (): Promise<WatchdogStatus & { alive: boolean; deployed: boolean }> =>
+    invoke("get_watchdog_status", {}),
+  deployWatchdog: (): Promise<boolean> =>
+    invoke("deploy_watchdog", {}),
+  startWatchdog: (): Promise<boolean> =>
+    invoke("start_watchdog", {}),
+  stopWatchdog: (): Promise<boolean> =>
+    invoke("stop_watchdog", {}),
+  uninstallWatchdog: (): Promise<boolean> =>
+    invoke("uninstall_watchdog", {}),
+
+  // Remote cron
+  remoteListCronJobs: (hostId: string): Promise<CronJob[]> =>
+    invoke("remote_list_cron_jobs", { hostId }),
+  remoteGetCronRuns: (hostId: string, jobId: string, limit?: number): Promise<CronRun[]> =>
+    invoke("remote_get_cron_runs", { hostId, jobId, limit }),
+  remoteTriggerCronJob: (hostId: string, jobId: string): Promise<string> =>
+    invoke("remote_trigger_cron_job", { hostId, jobId }),
+  remoteDeleteCronJob: (hostId: string, jobId: string): Promise<string> =>
+    invoke("remote_delete_cron_job", { hostId, jobId }),
+
+  // Remote watchdog
+  remoteGetWatchdogStatus: (hostId: string): Promise<WatchdogStatus & { alive: boolean; deployed: boolean }> =>
+    invoke("remote_get_watchdog_status", { hostId }),
+  remoteDeployWatchdog: (hostId: string): Promise<boolean> =>
+    invoke("remote_deploy_watchdog", { hostId }),
+  remoteStartWatchdog: (hostId: string): Promise<boolean> =>
+    invoke("remote_start_watchdog", { hostId }),
+  remoteStopWatchdog: (hostId: string): Promise<boolean> =>
+    invoke("remote_stop_watchdog", { hostId }),
+  remoteUninstallWatchdog: (hostId: string): Promise<boolean> =>
+    invoke("remote_uninstall_watchdog", { hostId }),
+
+  // Queue management
+  queueCommand: (label: string, command: string[]): Promise<PendingCommand> =>
+    invoke("queue_command", { label, command }),
+  removeQueuedCommand: (id: string): Promise<boolean> =>
+    invoke("remove_queued_command", { id }),
+  listQueuedCommands: (): Promise<PendingCommand[]> =>
+    invoke("list_queued_commands", {}),
+  discardQueuedCommands: (): Promise<boolean> =>
+    invoke("discard_queued_commands", {}),
+  previewQueuedCommands: (): Promise<PreviewQueueResult> =>
+    invoke("preview_queued_commands", {}),
+  applyQueuedCommands: (): Promise<ApplyQueueResult> =>
+    invoke("apply_queued_commands", {}),
+  queuedCommandsCount: (): Promise<number> =>
+    invoke("queued_commands_count", {}),
+
+  // Remote queue management
+  remoteQueueCommand: (hostId: string, label: string, command: string[]): Promise<PendingCommand> =>
+    invoke("remote_queue_command", { hostId, label, command }),
+  remoteRemoveQueuedCommand: (hostId: string, id: string): Promise<boolean> =>
+    invoke("remote_remove_queued_command", { hostId, id }),
+  remoteListQueuedCommands: (hostId: string): Promise<PendingCommand[]> =>
+    invoke("remote_list_queued_commands", { hostId }),
+  remoteDiscardQueuedCommands: (hostId: string): Promise<boolean> =>
+    invoke("remote_discard_queued_commands", { hostId }),
+  remotePreviewQueuedCommands: (hostId: string): Promise<PreviewQueueResult> =>
+    invoke("remote_preview_queued_commands", { hostId }),
+  remoteApplyQueuedCommands: (hostId: string): Promise<ApplyQueueResult> =>
+    invoke("remote_apply_queued_commands", { hostId }),
+  remoteQueuedCommandsCount: (hostId: string): Promise<number> =>
+    invoke("remote_queued_commands_count", { hostId }),
+
+  // Doctor Agent
+  doctorPortForward: (hostId: string): Promise<number> =>
+    invoke("doctor_port_forward", { hostId }),
+  doctorReadRemoteCredentials: (hostId: string): Promise<GatewayCredentials> =>
+    invoke("doctor_read_remote_credentials", { hostId }),
+  doctorAutoPair: (hostId: string): Promise<number> =>
+    invoke("doctor_auto_pair", { hostId }),
+  doctorConnect: (url: string, credentials?: GatewayCredentials): Promise<void> =>
+    invoke("doctor_connect", { url, credentials: credentials ?? null }),
+  doctorDisconnect: (): Promise<void> =>
+    invoke("doctor_disconnect"),
+  doctorStartDiagnosis: (context: string, sessionKey: string, agentId?: string): Promise<void> =>
+    invoke("doctor_start_diagnosis", { context, sessionKey, agentId: agentId ?? "main" }),
+  doctorSendMessage: (message: string, sessionKey: string, agentId?: string): Promise<void> =>
+    invoke("doctor_send_message", { message, sessionKey, agentId: agentId ?? "main" }),
+  doctorApproveInvoke: (invokeId: string, target: string, sessionKey: string, agentId: string): Promise<Record<string, unknown>> =>
+    invoke("doctor_approve_invoke", { invokeId, target, sessionKey, agentId }),
+  doctorRejectInvoke: (invokeId: string, reason: string): Promise<void> =>
+    invoke("doctor_reject_invoke", { invokeId, reason }),
+  collectDoctorContext: (): Promise<string> =>
+    invoke("collect_doctor_context"),
+  collectDoctorContextRemote: (hostId: string): Promise<string> =>
+    invoke("collect_doctor_context_remote", { hostId }),
+  doctorBridgeConnect: (url: string, credentials?: GatewayCredentials): Promise<void> =>
+    invoke("doctor_bridge_connect", { url, credentials: credentials ?? null }),
+  doctorBridgeDisconnect: (): Promise<void> =>
+    invoke("doctor_bridge_disconnect"),
+  doctorBridgeNodeId: (): Promise<string> =>
+    invoke("doctor_bridge_node_id"),
+
+  // Logs
+  readAppLog: (lines?: number): Promise<string> =>
+    invoke("read_app_log", { lines }),
+  readErrorLog: (lines?: number): Promise<string> =>
+    invoke("read_error_log", { lines }),
+  readGatewayLog: (lines?: number): Promise<string> =>
+    invoke("read_gateway_log", { lines }),
+  readGatewayErrorLog: (lines?: number): Promise<string> =>
+    invoke("read_gateway_error_log", { lines }),
+  remoteReadAppLog: (hostId: string, lines?: number): Promise<string> =>
+    invoke("remote_read_app_log", { hostId, lines }),
+  remoteReadErrorLog: (hostId: string, lines?: number): Promise<string> =>
+    invoke("remote_read_error_log", { hostId, lines }),
+  remoteReadGatewayLog: (hostId: string, lines?: number): Promise<string> =>
+    invoke("remote_read_gateway_log", { hostId, lines }),
+  remoteReadGatewayErrorLog: (hostId: string, lines?: number): Promise<string> =>
+    invoke("remote_read_gateway_error_log", { hostId, lines }),
 };

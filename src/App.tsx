@@ -2,44 +2,44 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { check } from "@tauri-apps/plugin-updater";
 import { getVersion } from "@tauri-apps/api/app";
+import {
+  HomeIcon,
+  BookOpenIcon,
+  HashIcon,
+  ClockIcon,
+  HistoryIcon,
+  StethoscopeIcon,
+  LayersIcon,
+  SettingsIcon,
+  MessageCircleIcon,
+  XIcon,
+} from "lucide-react";
 import { Home } from "./pages/Home";
 import { Recipes } from "./pages/Recipes";
 import { Cook } from "./pages/Cook";
 import { History } from "./pages/History";
 import { Settings } from "./pages/Settings";
 import { Doctor } from "./pages/Doctor";
+import { Sessions } from "./pages/Sessions";
 import { Channels } from "./pages/Channels";
+import { Cron } from "./pages/Cron";
 import { Chat } from "./components/Chat";
 import logoUrl from "./assets/logo.png";
-import { DiffViewer } from "./components/DiffViewer";
+import { PendingChangesBar } from "./components/PendingChangesBar";
 import { InstanceTabBar } from "./components/InstanceTabBar";
 import { InstanceContext } from "./lib/instance-context";
 import { api } from "./lib/api";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { Toaster } from "sonner";
 import type { DiscordGuildChannel, SshHost } from "./lib/types";
 
 const PING_URL = "https://api.clawpal.zhixian.io/ping";
 
-type Route = "home" | "recipes" | "cook" | "history" | "channels" | "doctor" | "settings";
+type Route = "home" | "recipes" | "cook" | "history" | "channels" | "cron" | "doctor" | "sessions" | "settings";
 
 interface ToastItem {
   id: number;
@@ -48,6 +48,27 @@ interface ToastItem {
 }
 
 let toastIdCounter = 0;
+
+const SSH_ERROR_MAP: Array<[RegExp, string]> = [
+  [/connection refused/i, "ssh.errorConnectionRefused"],
+  [/no such file/i, "ssh.errorNoSuchFile"],
+  [/passphrase|sign_and_send_pubkey|agent refused operation|can't open \/dev\/tty|authentication agent/i, "ssh.errorPassphrase"],
+  [/permission denied/i, "ssh.errorPermissionDenied"],
+  [/host key verification failed/i, "ssh.errorHostKey"],
+  [/timed?\s*out/i, "ssh.errorTimeout"],
+];
+
+const SSH_PASSPHRASE_RETRY_HINT =
+  /permission denied|publickey|passphrase|sign_and_send_pubkey|agent refused operation|can't open \/dev\/tty|authentication agent/i;
+
+function friendlySshError(raw: string, t: (key: string, opts?: Record<string, string>) => string): string {
+  for (const [pattern, key] of SSH_ERROR_MAP) {
+    if (pattern.test(raw)) {
+      return `${t(key)}\n(${raw})`;
+    }
+  }
+  return t('config.sshFailed', { error: raw });
+}
 
 export function App() {
   const { t } = useTranslation();
@@ -71,6 +92,7 @@ export function App() {
   }, [refreshHosts]);
 
   const [appUpdateAvailable, setAppUpdateAvailable] = useState(false);
+  const [hasEscalatedCron, setHasEscalatedCron] = useState(false);
 
   // Startup: check for updates + analytics ping
   useEffect(() => {
@@ -98,86 +120,166 @@ export function App() {
   }, []);
 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const sshHealthFailStreakRef = useRef<Record<string, number>>({});
+  const passphraseResolveRef = useRef<((value: string | null) => void) | null>(null);
+  const [passphraseHostLabel, setPassphraseHostLabel] = useState<string>("");
+  const [passphraseOpen, setPassphraseOpen] = useState(false);
+  const [passphraseInput, setPassphraseInput] = useState("");
 
   const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
     const id = ++toastIdCounter;
     setToasts((prev) => [...prev, { id, message, type }]);
-    if (type !== "error") {
-      setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 3000);
-    }
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, type === "error" ? 5000 : 3000);
   }, []);
 
   const dismissToast = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
+  const requestPassphrase = useCallback((hostLabel: string): Promise<string | null> => {
+    setPassphraseHostLabel(hostLabel);
+    setPassphraseInput("");
+    setPassphraseOpen(true);
+    return new Promise((resolve) => {
+      passphraseResolveRef.current = resolve;
+    });
+  }, []);
+
+  const closePassphraseDialog = useCallback((value: string | null) => {
+    setPassphraseOpen(false);
+    const resolve = passphraseResolveRef.current;
+    passphraseResolveRef.current = null;
+    if (resolve) resolve(value);
+  }, []);
+
+  const connectWithPassphraseFallback = useCallback(async (hostId: string) => {
+    const host = sshHosts.find((h) => h.id === hostId);
+    if (host && host.authMethod === "key") {
+      const passphrase = await requestPassphrase(host.label || host.host);
+      if (passphrase === null) {
+        throw new Error(t("ssh.passphraseCancelled"));
+      }
+      await api.sshConnectWithPassphrase(hostId, passphrase);
+      return;
+    }
+
+    try {
+      await api.sshConnect(hostId);
+      return;
+    } catch (err) {
+      const raw = String(err);
+      if (host && host.authMethod !== "password" && SSH_PASSPHRASE_RETRY_HINT.test(raw)) {
+        const passphrase = await requestPassphrase(host.label || host.host);
+        if (passphrase !== null) {
+          await api.sshConnectWithPassphrase(hostId, passphrase);
+          return;
+        }
+      }
+      throw err;
+    }
+  }, [requestPassphrase, sshHosts, t]);
+
 
   const handleInstanceSelect = useCallback((id: string) => {
     setActiveInstance(id);
     if (id !== "local") {
-      // Always set to disconnected first, then attempt (re)connect
-      setConnectionStatus((prev) => ({ ...prev, [id]: "disconnected" }));
-      api.sshConnect(id)
-        .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })))
-        .catch((e) => {
-          setConnectionStatus((prev) => ({ ...prev, [id]: "error" }));
-          showToast(t('config.sshFailed', { error: String(e) }), "error");
+      // Check if backend still has a live connection before reconnecting.
+      // Do not pre-mark as disconnected — transient status failures would
+      // otherwise gray out the whole remote UI.
+      api.sshStatus(id)
+        .then((status) => {
+          if (status === "connected") {
+            setConnectionStatus((prev) => ({ ...prev, [id]: "connected" }));
+          } else {
+            return connectWithPassphraseFallback(id)
+              .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })));
+          }
+        })
+        .catch(() => {
+          // sshStatus failed or reconnect failed — try fresh connect
+          connectWithPassphraseFallback(id)
+            .then(() => setConnectionStatus((prev) => ({ ...prev, [id]: "connected" })))
+            .catch((e2) => {
+              setConnectionStatus((prev) => ({ ...prev, [id]: "error" }));
+              const raw = String(e2);
+              const friendly = friendlySshError(raw, t);
+              showToast(friendly, "error");
+            });
         });
     }
-  }, [showToast, t]);
+  }, [connectWithPassphraseFallback, showToast, t]);
 
-  // Config dirty state
-  const [dirty, setDirty] = useState(false);
-  const [showApplyDialog, setShowApplyDialog] = useState(false);
-  const [showDiscardDialog, setShowDiscardDialog] = useState(false);
-  const [applyDiffBaseline, setApplyDiffBaseline] = useState("");
-  const [applyDiffCurrent, setApplyDiffCurrent] = useState("");
-  const [applying, setApplying] = useState(false);
-  const [applyError, setApplyError] = useState("");
   const [configVersion, setConfigVersion] = useState(0);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isRemote = activeInstance !== "local";
   const isConnected = !isRemote || connectionStatus[activeInstance] === "connected";
 
-  // Establish baseline on startup or instance change
+  // Keep active remote instance self-healed: detect dropped SSH and reconnect.
   useEffect(() => {
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteSaveConfigBaseline(activeInstance).catch((e) => console.error("Failed to save remote config baseline:", e));
-    } else {
-      api.saveConfigBaseline().catch((e) => console.error("Failed to save config baseline:", e));
-    }
-  }, [activeInstance, isRemote, isConnected]);
+    if (!isRemote) return;
+    let cancelled = false;
+    let inFlight = false;
+    const hostId = activeInstance;
 
-  // Poll for dirty state
-  const checkDirty = useCallback(() => {
-    if (isRemote) {
-      if (!isConnected) return;
-      api.remoteCheckConfigDirty(activeInstance)
-        .then((state) => setDirty(state.dirty))
-        .catch((e) => console.error("Failed to check remote config dirty state:", e));
-    } else {
-      api.checkConfigDirty()
-        .then((state) => setDirty(state.dirty))
-        .catch((e) => console.error("Failed to check config dirty state:", e));
-    }
-  }, [isRemote, isConnected, activeInstance]);
-
-  useEffect(() => {
-    setDirty(false); // Reset dirty on instance change
-    checkDirty();
-    pollRef.current = setInterval(checkDirty, isRemote ? 5000 : 2000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+    const checkAndHeal = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const status = await api.sshStatus(hostId);
+        if (cancelled) return;
+        if (status === "connected") {
+          sshHealthFailStreakRef.current[hostId] = 0;
+          setConnectionStatus((prev) => ({ ...prev, [hostId]: "connected" }));
+          return;
+        }
+        try {
+          await api.sshConnect(hostId);
+          if (!cancelled) {
+            sshHealthFailStreakRef.current[hostId] = 0;
+            setConnectionStatus((prev) => ({ ...prev, [hostId]: "connected" }));
+          }
+        } catch {
+          if (!cancelled) {
+            const streak = (sshHealthFailStreakRef.current[hostId] || 0) + 1;
+            sshHealthFailStreakRef.current[hostId] = streak;
+            // Avoid flipping UI to disconnected/error on a single transient failure.
+            if (streak >= 2) {
+              setConnectionStatus((prev) => ({ ...prev, [hostId]: "error" }));
+            }
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          const streak = (sshHealthFailStreakRef.current[hostId] || 0) + 1;
+          sshHealthFailStreakRef.current[hostId] = streak;
+          if (streak >= 2) {
+            setConnectionStatus((prev) => ({ ...prev, [hostId]: "error" }));
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
     };
-  }, [checkDirty]);
 
-  // Load Discord data + extract profiles on startup or instance change
+    checkAndHeal();
+    const timer = setInterval(checkAndHeal, 15_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeInstance, isRemote]);
+
+  // Clear cached Discord channels only when switching instance.
+  // Avoid clearing on transient connection-status changes, which causes
+  // Channels page to flicker between "no cache" and loaded data.
   useEffect(() => {
     setDiscordGuildChannels([]);
+  }, [activeInstance]);
+
+  // Load Discord data + extract profiles on startup or connection ready
+  useEffect(() => {
     if (activeInstance === "local") {
       if (!localStorage.getItem("clawpal_profiles_extracted")) {
         api.extractModelProfilesFromConfig()
@@ -192,60 +294,54 @@ export function App() {
     }
   }, [activeInstance, isConnected]);
 
+  // Poll watchdog status for escalated cron jobs (red dot badge)
+  useEffect(() => {
+    const check = () => {
+      const p = isRemote
+        ? api.remoteGetWatchdogStatus(activeInstance)
+        : api.getWatchdogStatus();
+      p.then((status: any) => {
+        if (status?.jobs) {
+          const escalated = Object.values(status.jobs).some((j: any) => j.status === "escalated");
+          setHasEscalatedCron(escalated);
+        } else {
+          setHasEscalatedCron(false);
+        }
+      }).catch(() => setHasEscalatedCron(false));
+    };
+    check();
+    const interval = setInterval(check, 30000);
+    return () => clearInterval(interval);
+  }, [activeInstance, isRemote]);
+
   const bumpConfigVersion = useCallback(() => {
     setConfigVersion((v) => v + 1);
   }, []);
 
-  const handleApplyClick = () => {
-    if (isRemote && !isConnected) return;
-    // Load diff data for the dialog
-    const checkPromise = isRemote
-      ? api.remoteCheckConfigDirty(activeInstance)
-      : api.checkConfigDirty();
-    checkPromise
-      .then((state) => {
-        setApplyDiffBaseline(state.baseline);
-        setApplyDiffCurrent(state.current);
-        setApplyError("");
-        setShowApplyDialog(true);
-      })
-      .catch((e) => console.error("Failed to load config diff:", e));
-  };
 
-  const handleApplyConfirm = () => {
-    setApplying(true);
-    setApplyError("");
-    const applyPromise = isRemote
-      ? api.remoteApplyPendingChanges(activeInstance)
-      : api.applyPendingChanges();
-    applyPromise
-      .then(() => {
-        setShowApplyDialog(false);
-        setDirty(false);
-        bumpConfigVersion();
-        showToast(t('config.gatewayRestarted'));
-      })
-      .catch((e) => setApplyError(String(e)))
-      .finally(() => setApplying(false));
-  };
+  const navItems: { route: Route | Route[]; icon: React.ReactNode; label: string; badge?: React.ReactNode }[] = [
+    { route: "home", icon: <HomeIcon className="size-4" />, label: t('nav.home') },
+    { route: ["recipes", "cook"] as Route[], icon: <BookOpenIcon className="size-4" />, label: t('nav.recipes') },
+    { route: "channels", icon: <HashIcon className="size-4" />, label: t('nav.channels') },
+    {
+      route: "cron",
+      icon: <ClockIcon className="size-4" />,
+      label: t('nav.cron'),
+      badge: hasEscalatedCron ? <span className="ml-auto w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : undefined,
+    },
+    { route: "history", icon: <HistoryIcon className="size-4" />, label: t('nav.history') },
+    { route: "doctor", icon: <StethoscopeIcon className="size-4" />, label: t('nav.doctor') },
+    { route: "sessions", icon: <LayersIcon className="size-4" />, label: t('nav.sessions') },
+  ];
 
-  const handleDiscardConfirm = () => {
-    const discardPromise = isRemote
-      ? api.remoteDiscardConfigChanges(activeInstance)
-      : api.discardConfigChanges();
-    discardPromise
-      .then(() => {
-        setShowDiscardDialog(false);
-        setDirty(false);
-        bumpConfigVersion();
-        showToast(t('config.changesDiscarded'));
-      })
-      .catch((e) => showToast(t('config.discardFailed', { error: String(e) }), "error"));
+  const isRouteActive = (item: typeof navItems[0]) => {
+    if (Array.isArray(item.route)) return item.route.includes(route);
+    return route === item.route;
   };
 
   return (
     <>
-    <div className="flex flex-col h-screen">
+    <div className="flex flex-col h-screen bg-background text-foreground">
       <InstanceTabBar
         hosts={sshHosts}
         activeId={activeInstance}
@@ -253,272 +349,236 @@ export function App() {
         onSelect={handleInstanceSelect}
         onHostsChange={refreshHosts}
       />
+      <InstanceContext.Provider value={{ instanceId: activeInstance, isRemote, isConnected, discordGuildChannels }}>
       <div className="flex flex-1 overflow-hidden">
-      <aside className="w-[200px] min-w-[200px] bg-muted border-r border-border flex flex-col py-4">
-        <h1 className="px-4 text-lg font-bold mb-4 flex items-center gap-2">
-          <img src={logoUrl} alt="" className="w-9 h-9 rounded-lg" />
-          ClawPal
-        </h1>
-        <nav className="flex flex-col gap-1 px-2 flex-1">
-          <Button
-            variant="ghost"
+
+      {/* ── Sidebar ── */}
+      <aside className="w-[220px] min-w-[220px] bg-sidebar border-r border-sidebar-border flex flex-col py-5">
+        <div className="px-5 mb-6 flex items-center gap-2.5">
+          <img src={logoUrl} alt="" className="w-9 h-9 rounded-xl shadow-sm" />
+          <h1 className="text-xl font-bold tracking-tight" style={{ fontFamily: "'Fraunces', Georgia, serif" }}>
+            ClawPal
+          </h1>
+        </div>
+
+        <nav className="flex flex-col gap-0.5 px-3 flex-1">
+          {navItems.map((item) => {
+            const active = isRouteActive(item);
+            const targetRoute = Array.isArray(item.route) ? item.route[0] : item.route;
+            return (
+              <button
+                key={targetRoute}
+                className={cn(
+                  "flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 cursor-pointer",
+                  active
+                    ? "bg-primary/10 text-primary shadow-sm"
+                    : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                )}
+                onClick={() => setRoute(targetRoute)}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+                {item.badge}
+              </button>
+            );
+          })}
+
+          <div className="my-3 h-px bg-border/60" />
+
+          <button
             className={cn(
-              "justify-start hover:bg-accent",
-              (route === "home") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
-            )}
-            onClick={() => setRoute("home")}
-          >
-            {t('nav.home')}
-          </Button>
-          <Button
-            variant="ghost"
-            className={cn(
-              "justify-start hover:bg-accent",
-              (route === "recipes" || route === "cook") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
-            )}
-            onClick={() => setRoute("recipes")}
-          >
-            {t('nav.recipes')}
-          </Button>
-          <Button
-            variant="ghost"
-            className={cn(
-              "justify-start hover:bg-accent",
-              (route === "channels") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
-            )}
-            onClick={() => setRoute("channels")}
-          >
-            {t('nav.channels')}
-          </Button>
-          <Button
-            variant="ghost"
-            className={cn(
-              "justify-start hover:bg-accent",
-              (route === "history") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
-            )}
-            onClick={() => setRoute("history")}
-          >
-            {t('nav.history')}
-          </Button>
-          <Button
-            variant="ghost"
-            className={cn(
-              "justify-start hover:bg-accent",
-              (route === "doctor") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
-            )}
-            onClick={() => setRoute("doctor")}
-          >
-            {t('nav.doctor')}
-          </Button>
-          <Separator className="my-2" />
-          <Button
-            variant="ghost"
-            className={cn(
-              "justify-start hover:bg-accent",
-              (route === "settings") && "bg-accent text-accent-foreground border-l-[3px] border-primary"
+              "flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 cursor-pointer",
+              route === "settings"
+                ? "bg-primary/10 text-primary shadow-sm"
+                : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             )}
             onClick={() => setRoute("settings")}
           >
-            {t('nav.settings')}
+            <SettingsIcon className="size-4" />
+            <span>{t('nav.settings')}</span>
             {appUpdateAvailable && (
-              <span className="ml-1.5 w-2 h-2 rounded-full bg-destructive inline-block" />
+              <span className="ml-auto w-2 h-2 rounded-full bg-destructive animate-pulse" />
             )}
-          </Button>
+          </button>
         </nav>
 
-        <div className="px-4 pb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <div className="px-5 pb-3 flex items-center gap-2 text-xs text-muted-foreground/70">
           <a
             href="#"
-            className="hover:text-foreground transition-colors"
+            className="hover:text-foreground transition-colors duration-200"
             onClick={(e) => { e.preventDefault(); api.openUrl("https://clawpal.zhixian.io"); }}
           >
             {t('nav.website')}
           </a>
-          <span>·</span>
+          <span className="text-border">·</span>
           <a
             href="#"
-            className="hover:text-foreground transition-colors"
+            className="hover:text-foreground transition-colors duration-200"
             onClick={(e) => { e.preventDefault(); api.openUrl("https://x.com/zhixianio"); }}
           >
             @zhixian
           </a>
         </div>
 
-        {/* Dirty config action bar */}
-        {dirty && (
-          <div className="px-2 pb-2 space-y-1.5">
-            <Separator className="mb-2" />
-            <p className="text-xs text-center text-muted-foreground px-1">{t('config.pendingChanges')}</p>
-            <Button
-              className="w-full"
-              size="sm"
-              onClick={handleApplyClick}
-            >
-              {t('config.applyChanges')}
-            </Button>
-            <Button
-              className="w-full"
-              size="sm"
-              variant="outline"
-              onClick={() => setShowDiscardDialog(true)}
-            >
-              {t('config.discard')}
-            </Button>
-          </div>
-        )}
+        <PendingChangesBar
+          showToast={showToast}
+          onApplied={bumpConfigVersion}
+        />
       </aside>
-      <InstanceContext.Provider value={{ instanceId: activeInstance, isRemote, isConnected, discordGuildChannels }}>
-      <main className="flex-1 overflow-y-auto p-4 relative">
-        {/* Chat toggle -- top-right corner */}
+
+      {/* ── Main Content ── */}
+      <main className="flex-1 overflow-y-auto p-6 relative">
+        {/* Chat toggle — floating pill */}
         {!chatOpen && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="absolute top-4 right-4 z-10"
+          <button
+            className="absolute top-5 right-5 z-10 flex items-center gap-2 px-3.5 py-2 rounded-full bg-primary/10 text-primary text-sm font-medium hover:bg-primary/15 transition-all duration-200 shadow-sm cursor-pointer"
             onClick={() => setChatOpen(true)}
           >
+            <MessageCircleIcon className="size-4" />
             {t('nav.chat')}
-          </Button>
+          </button>
         )}
 
-        {route === "home" && (
-          <Home
-            key={`${activeInstance}-${configVersion}`}
-            onCook={(id, source) => {
-              setRecipeId(id);
-              setRecipeSource(source);
-              setRoute("cook");
-            }}
-            showToast={showToast}
-          />
-        )}
-        {route === "recipes" && (
-          <Recipes
-            onCook={(id, source) => {
-              setRecipeId(id);
-              setRecipeSource(source);
-              setRoute("cook");
-            }}
-          />
-        )}
-        {route === "cook" && recipeId && (
-          <Cook
-            recipeId={recipeId}
-            recipeSource={recipeSource}
-            onDone={() => {
-              setRoute("recipes");
-            }}
-          />
-        )}
-        {route === "cook" && !recipeId && <p>{t('config.noRecipeSelected')}</p>}
-        {route === "channels" && (
-          <Channels
-            key={`${activeInstance}-${configVersion}`}
-            showToast={showToast}
-          />
-        )}
-        {route === "history" && <History key={`${activeInstance}-${configVersion}`} />}
-        {route === "doctor" && <Doctor />}
-        {route === "settings" && (
-          <Settings
-            key={`${activeInstance}-${configVersion}`}
-            onDataChange={bumpConfigVersion}
-            hasAppUpdate={appUpdateAvailable}
-            onAppUpdateSeen={() => setAppUpdateAvailable(false)}
-          />
-        )}
+        <div className="animate-warm-enter">
+          {route === "home" && (
+            <Home
+              key={`${activeInstance}-${configVersion}`}
+              onCook={(id, source) => {
+                setRecipeId(id);
+                setRecipeSource(source);
+                setRoute("cook");
+              }}
+              showToast={showToast}
+              onNavigate={(r) => setRoute(r as Route)}
+            />
+          )}
+          {route === "recipes" && (
+            <Recipes
+              onCook={(id, source) => {
+                setRecipeId(id);
+                setRecipeSource(source);
+                setRoute("cook");
+              }}
+            />
+          )}
+          {route === "cook" && recipeId && (
+            <Cook
+              recipeId={recipeId}
+              recipeSource={recipeSource}
+              onDone={() => {
+                setRoute("recipes");
+              }}
+            />
+          )}
+          {route === "cook" && !recipeId && <p>{t('config.noRecipeSelected')}</p>}
+          {route === "channels" && (
+            <Channels
+              key={`${activeInstance}-${configVersion}`}
+              showToast={showToast}
+            />
+          )}
+          {route === "cron" && <Cron key={`${activeInstance}`} />}
+          {route === "history" && <History key={`${activeInstance}-${configVersion}`} />}
+          <div className={route === "doctor" ? undefined : "hidden"}><Doctor sshHosts={sshHosts} /></div>
+          {route === "sessions" && <Sessions />}
+          {route === "settings" && (
+            <Settings
+              key={`${activeInstance}-${configVersion}`}
+              onDataChange={bumpConfigVersion}
+              hasAppUpdate={appUpdateAvailable}
+              onAppUpdateSeen={() => setAppUpdateAvailable(false)}
+            />
+          )}
+        </div>
       </main>
 
-      {/* Chat Panel -- inline, pushes main content */}
+      {/* ── Chat Panel ── */}
       {chatOpen && (
-        <aside className="w-[360px] min-w-[360px] border-l border-border flex flex-col bg-background">
-          <div className="flex items-center justify-between px-4 pt-4 pb-2">
+        <aside className="w-[380px] min-w-[380px] border-l border-border flex flex-col bg-card">
+          <div className="flex items-center justify-between px-5 pt-5 pb-3">
             <h2 className="text-lg font-semibold">{t('nav.chat')}</h2>
             <Button
               variant="ghost"
-              size="sm"
-              className="h-7 w-7 p-0"
+              size="icon-xs"
               onClick={() => setChatOpen(false)}
             >
-              &times;
+              <XIcon className="size-4" />
             </Button>
           </div>
-          <div className="flex-1 overflow-hidden px-4 pb-4">
+          <div className="flex-1 overflow-hidden px-5 pb-5">
             <Chat />
           </div>
         </aside>
       )}
-      </InstanceContext.Provider>
       </div>
+      </InstanceContext.Provider>
     </div>
 
-    {/* Apply Changes Dialog */}
-    <Dialog open={showApplyDialog} onOpenChange={setShowApplyDialog}>
-      <DialogContent className="max-w-3xl">
-        <DialogHeader>
-          <DialogTitle>{t('config.applyTitle')}</DialogTitle>
-        </DialogHeader>
-        <p className="text-sm text-muted-foreground">
-          {t('config.applyDescription')}
-        </p>
-        <DiffViewer oldValue={applyDiffBaseline} newValue={applyDiffCurrent} />
-        {applyError && (
-          <p className="text-sm text-destructive">{applyError}</p>
-        )}
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setShowApplyDialog(false)} disabled={applying}>
-            {t('config.cancel')}
-          </Button>
-          <Button onClick={handleApplyConfirm} disabled={applying}>
-            {applying ? t('config.applying') : t('config.applyRestart')}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-
-    {/* Discard Changes Dialog */}
-    <AlertDialog open={showDiscardDialog} onOpenChange={setShowDiscardDialog}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{t('config.discardTitle')}</AlertDialogTitle>
-          <AlertDialogDescription>
-            {t('config.discardDescription')}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>{t('config.cancel')}</AlertDialogCancel>
-          <AlertDialogAction
-            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            onClick={handleDiscardConfirm}
-          >
-            {t('config.discard')}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-
-    {/* Toast Stack */}
+    {/* ── Toast Stack ── */}
     {toasts.length > 0 && (
-      <div className="fixed bottom-4 right-4 z-50 flex flex-col-reverse gap-2">
+      <div className="fixed bottom-5 right-5 z-50 flex flex-col-reverse gap-2.5">
         {toasts.map((toast) => (
           <div
             key={toast.id}
             className={cn(
-              "flex items-center gap-2 px-4 py-2.5 rounded-md shadow-lg text-sm font-medium animate-in fade-in slide-in-from-bottom-2",
-              toast.type === "success" ? "bg-green-600 text-white" : "bg-destructive text-destructive-foreground"
+              "flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium animate-in fade-in slide-in-from-bottom-3 duration-300",
+              toast.type === "success"
+                ? "bg-green-500/10 text-green-700 border border-green-500/20 shadow-sm dark:bg-green-500/15 dark:text-green-400 dark:border-green-500/20"
+                : "bg-red-500/10 text-red-700 border border-red-500/20 shadow-sm dark:bg-red-500/15 dark:text-red-400 dark:border-red-500/20"
             )}
           >
             <span className="flex-1">{toast.message}</span>
             <button
-              className="opacity-70 hover:opacity-100 text-current ml-2"
+              className="opacity-50 hover:opacity-100 transition-opacity ml-1 cursor-pointer"
               onClick={() => dismissToast(toast.id)}
             >
-              &times;
+              <XIcon className="size-3.5" />
             </button>
           </div>
         ))}
       </div>
     )}
+
+    <Dialog
+      open={passphraseOpen}
+      onOpenChange={(open) => {
+        if (!open) closePassphraseDialog(null);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("ssh.passphraseTitle")}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            {t("ssh.passphrasePrompt", { host: passphraseHostLabel })}
+          </p>
+          <Label htmlFor="ssh-passphrase">{t("ssh.passphraseLabel")}</Label>
+          <Input
+            id="ssh-passphrase"
+            type="password"
+            value={passphraseInput}
+            onChange={(e) => setPassphraseInput(e.target.value)}
+            placeholder={t("ssh.passphrasePlaceholder")}
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                closePassphraseDialog(passphraseInput);
+              }
+            }}
+          />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => closePassphraseDialog(null)}>
+            {t("instance.cancel")}
+          </Button>
+          <Button onClick={() => closePassphraseDialog(passphraseInput)}>
+            {t("ssh.passphraseConfirm")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Toaster position="top-right" richColors />
     </>
   );
 }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,9 +17,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
-import type { SshHost } from "@/lib/types";
+import type { SshConfigHostSuggestion, SshHost } from "@/lib/types";
 
 interface InstanceTabBarProps {
   hosts: SshHost[];
@@ -33,7 +44,7 @@ const emptyHost: Omit<SshHost, "id"> = {
   label: "",
   host: "",
   port: 22,
-  username: "",
+  username: "root",
   authMethod: "ssh_config",
   keyPath: undefined,
   password: undefined,
@@ -51,10 +62,40 @@ export function InstanceTabBar({
   const [editingHost, setEditingHost] = useState<SshHost | null>(null);
   const [form, setForm] = useState<Omit<SshHost, "id">>(emptyHost);
   const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string>("");
+  const [keyGuideOpen, setKeyGuideOpen] = useState(false);
+  const [sshConfigHosts, setSshConfigHosts] = useState<SshConfigHostSuggestion[]>([]);
+  const [selectedConfigAlias, setSelectedConfigAlias] = useState<string | undefined>(undefined);
+  const duplicateDisplayNames = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const host of hosts) {
+      const key = (host.label || host.host).trim().toLowerCase();
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return counts;
+  }, [hosts]);
+  const hasDuplicateInputName = useMemo(() => {
+    const pending = (form.label.trim() || form.host.trim()).toLowerCase();
+    if (!pending) return false;
+    return hosts.some(
+      (h) =>
+        h.id !== editingHost?.id &&
+        ((h.label || h.host).trim().toLowerCase() === pending),
+    );
+  }, [editingHost?.id, form.host, form.label, hosts]);
+
+  useEffect(() => {
+    api
+      .listSshConfigHosts()
+      .then(setSshConfigHosts)
+      .catch((e) => console.error("Failed to load SSH config hosts:", e));
+  }, []);
 
   const openAddDialog = () => {
     setEditingHost(null);
     setForm({ ...emptyHost });
+    setFormError("");
+    setSelectedConfigAlias(undefined);
     setDialogOpen(true);
   };
 
@@ -69,14 +110,34 @@ export function InstanceTabBar({
       keyPath: host.keyPath,
       password: host.password,
     });
+    setFormError("");
+    setSelectedConfigAlias(undefined);
     setDialogOpen(true);
   };
 
+  const applySshConfigPreset = (hostAlias: string) => {
+    const preset = sshConfigHosts.find((h) => h.hostAlias === hostAlias);
+    if (!preset) return;
+    setForm((f) => ({
+      ...f,
+      label: f.label || hostAlias,
+      host: preset.hostAlias,
+      port: preset.port ?? f.port,
+      username: preset.user ?? f.username,
+      authMethod: "ssh_config",
+    }));
+  };
+
   const handleSave = () => {
+    if (hasDuplicateInputName) {
+      setFormError(t('instance.duplicateLabelError'));
+      return;
+    }
     const host: SshHost = {
       id: editingHost?.id ?? crypto.randomUUID(),
       ...form,
     };
+    setFormError("");
     setSaving(true);
     api
       .upsertSshHost(host)
@@ -101,23 +162,31 @@ export function InstanceTabBar({
   const statusDot = (status: "connected" | "disconnected" | "error" | undefined) => {
     const color =
       status === "connected"
-        ? "bg-green-500"
+        ? "bg-emerald-500"
         : status === "error"
-          ? "bg-red-500"
-          : "bg-gray-400";
-    return <span className={cn("inline-block w-2 h-2 rounded-full shrink-0", color)} />;
+          ? "bg-red-400"
+          : "bg-muted-foreground/40";
+    return <span className={cn("inline-block w-2 h-2 rounded-full shrink-0 transition-colors duration-300", color)} />;
+  };
+
+  const hostDisplayName = (host: SshHost) => {
+    const base = (host.label || host.host).trim();
+    const duplicate = (duplicateDisplayNames.get(base.toLowerCase()) || 0) > 1;
+    if (!duplicate) return base;
+    const userPrefix = host.username ? `${host.username}@` : "";
+    return `${base} (${userPrefix}${host.host}:${host.port})`;
   };
 
   return (
     <>
-      <div className="flex items-center gap-0.5 px-2 py-1.5 bg-muted border-b border-border overflow-x-auto shrink-0">
+      <div className="flex items-center gap-1 px-3 py-2 bg-sidebar border-b border-sidebar-border overflow-x-auto shrink-0">
         {/* Local tab */}
         <button
           className={cn(
-            "flex items-center gap-1.5 px-3 py-1 rounded text-sm whitespace-nowrap transition-colors",
+            "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm whitespace-nowrap transition-all duration-200 cursor-pointer",
             activeId === "local"
-              ? "bg-background shadow-sm font-medium"
-              : "hover:bg-background/50"
+              ? "bg-card shadow-sm font-semibold text-primary border-b-2 border-b-primary"
+              : "text-muted-foreground hover:text-foreground"
           )}
           onClick={() => onSelect("local")}
         >
@@ -133,10 +202,10 @@ export function InstanceTabBar({
           >
             <button
               className={cn(
-                "flex items-center gap-1.5 px-3 py-1 rounded text-sm whitespace-nowrap transition-colors",
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm whitespace-nowrap transition-all duration-200 cursor-pointer",
                 activeId === host.id
-                  ? "bg-background shadow-sm font-medium"
-                  : "hover:bg-background/50"
+                  ? "bg-card shadow-sm font-semibold text-primary border-b-2 border-b-primary"
+                  : "text-muted-foreground hover:text-foreground"
               )}
               onClick={() => onSelect(host.id)}
               onContextMenu={(e) => {
@@ -145,17 +214,37 @@ export function InstanceTabBar({
               }}
             >
               {statusDot(connectionStatus[host.id])}
-              {host.label || host.host}
+              {hostDisplayName(host)}
             </button>
-            <button
-              className="absolute -top-0.5 -right-0.5 hidden group-hover:flex items-center justify-center w-4 h-4 rounded-full bg-muted-foreground/20 hover:bg-destructive hover:text-white text-[10px] leading-none"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleDelete(host.id);
-              }}
-            >
-              &times;
-            </button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <button
+                  className="absolute -top-0.5 -right-0.5 hidden group-hover:flex items-center justify-center w-4 h-4 rounded-full bg-muted-foreground/20 hover:bg-destructive hover:text-white text-[10px] leading-none"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  &times;
+                </button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>{t('instance.deleteTitle')}</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {t('instance.deleteDescription', { label: hostDisplayName(host) })}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>{t('instance.cancel')}</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    onClick={() => handleDelete(host.id)}
+                  >
+                    {t('instance.deleteConfirm')}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         ))}
 
@@ -184,16 +273,54 @@ export function InstanceTabBar({
               <Input
                 id="ssh-label"
                 value={form.label}
-                onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))}
+                onChange={(e) => {
+                  setForm((f) => ({ ...f, label: e.target.value }));
+                  if (formError) setFormError("");
+                }}
                 placeholder={t('instance.labelPlaceholder')}
               />
+              {hasDuplicateInputName && (
+                <p className="text-xs text-destructive">
+                  {t('instance.duplicateLabelError')}
+                </p>
+              )}
             </div>
+            {sshConfigHosts.length > 0 && (
+              <div className="space-y-1.5">
+                <Label>{t('instance.sshConfigPreset')}</Label>
+                <Select
+                  value={selectedConfigAlias}
+                  onValueChange={(val) => {
+                    setSelectedConfigAlias(val);
+                    applySshConfigPreset(val);
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t('instance.sshConfigPresetPlaceholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {sshConfigHosts.map((h) => (
+                      <SelectItem key={h.hostAlias} value={h.hostAlias}>
+                        {h.hostAlias}
+                        {h.hostName ? ` (${h.user ? `${h.user}@` : ""}${h.hostName}${h.port ? `:${h.port}` : ""})` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('instance.sshConfigPresetHint')}
+                </p>
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="ssh-host">{t('instance.host')}</Label>
               <Input
                 id="ssh-host"
                 value={form.host}
-                onChange={(e) => setForm((f) => ({ ...f, host: e.target.value }))}
+                onChange={(e) => {
+                  setForm((f) => ({ ...f, host: e.target.value }));
+                  if (formError) setFormError("");
+                }}
                 placeholder="192.168.1.100"
                 autoCapitalize="off"
                 autoCorrect="off"
@@ -217,7 +344,6 @@ export function InstanceTabBar({
                 id="ssh-username"
                 value={form.username}
                 onChange={(e) => setForm((f) => ({ ...f, username: e.target.value }))}
-                placeholder={t('instance.usernamePlaceholder')}
                 autoCapitalize="off"
                 autoCorrect="off"
                 spellCheck={false}
@@ -232,7 +358,6 @@ export function InstanceTabBar({
                     ...f,
                     authMethod: val as SshHost["authMethod"],
                     keyPath: val === "key" ? (f.authMethod === "key" ? f.keyPath : "") : undefined,
-                    password: val === "password" ? (f.authMethod === "password" ? f.password : "") : undefined,
                   }))
                 }
               >
@@ -242,9 +367,15 @@ export function InstanceTabBar({
                 <SelectContent>
                   <SelectItem value="ssh_config">{t('instance.authSshConfig')}</SelectItem>
                   <SelectItem value="key">{t('instance.authKey')}</SelectItem>
-                  <SelectItem value="password">{t('instance.authPassword')}</SelectItem>
                 </SelectContent>
               </Select>
+              <button
+                type="button"
+                className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 mt-1"
+                onClick={() => setKeyGuideOpen(true)}
+              >
+                {t('instance.keyGuideLink')}
+              </button>
             </div>
             {form.authMethod === "key" && (
               <div className="space-y-1.5">
@@ -260,22 +391,13 @@ export function InstanceTabBar({
                 />
               </div>
             )}
-            {form.authMethod === "password" && (
-              <div className="space-y-1.5">
-                <Label htmlFor="ssh-password">{t('instance.password')}</Label>
-                <Input
-                  id="ssh-password"
-                  type="password"
-                  value={form.password || ""}
-                  onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))}
-                />
-                <p className="text-xs text-yellow-600 dark:text-yellow-400">
-                  {t('instance.passwordWarning')}
-                </p>
-              </div>
-            )}
           </div>
           <DialogFooter>
+            {formError && (
+              <p className="text-xs text-destructive mr-auto">
+                {formError}
+              </p>
+            )}
             <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>
               {t('instance.cancel')}
             </Button>
@@ -285,6 +407,65 @@ export function InstanceTabBar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* SSH Key Setup Guide Dialog */}
+      <Dialog open={keyGuideOpen} onOpenChange={setKeyGuideOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t('instance.keyGuideTitle')}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-5 text-sm">
+            {/* Step 1 */}
+            <div className="space-y-1.5">
+              <p className="font-medium">{t('instance.keyGuideStep1Title')}</p>
+              <CopyBlock text="ssh-keygen -t ed25519" />
+              <p className="text-xs text-muted-foreground">{t('instance.keyGuideStep1Hint')}</p>
+            </div>
+            {/* Step 2 */}
+            <div className="space-y-1.5">
+              <p className="font-medium">{t('instance.keyGuideStep2Title')}</p>
+              <CopyBlock text={`ssh-copy-id ${form.username || "root"}@${form.host || "your-host"} -p ${form.port || 22}`} />
+              <p className="text-xs text-muted-foreground">{t('instance.keyGuideStep2Hint')}</p>
+            </div>
+            {/* Step 3 */}
+            <div className="space-y-1.5">
+              <p className="font-medium">{t('instance.keyGuideStep3Title')}</p>
+              <ul className="list-disc list-inside text-muted-foreground text-xs space-y-0.5">
+                <li>{t('instance.keyGuideStep3Auth')}</li>
+                <li>{t('instance.keyGuideStep3Path')}</li>
+              </ul>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setKeyGuideOpen(false)}>
+              {t('instance.keyGuideClose')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
+  );
+}
+
+function CopyBlock({ text }: { text: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return (
+    <div className="flex items-center gap-2 bg-muted rounded px-3 py-1.5 font-mono text-xs">
+      <code className="flex-1 break-all">{text}</code>
+      <button
+        type="button"
+        className="shrink-0 text-muted-foreground hover:text-foreground text-xs"
+        onClick={handleCopy}
+      >
+        {copied ? t('instance.keyGuideCopied') : t('instance.keyGuideCopy')}
+      </button>
+    </div>
   );
 }

@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
 import { ParamForm } from "../components/ParamForm";
-import { resolveSteps, executeStep, type ResolvedStep } from "../lib/actions";
+import { resolveSteps, stepToCommands, type ResolvedStep } from "../lib/actions";
+import { useApi } from "@/lib/use-api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Recipe } from "../lib/types";
 import { useInstance } from "@/lib/instance-context";
+
 
 type Phase = "params" | "confirm" | "execute" | "done";
 type StepStatus = "pending" | "running" | "done" | "failed" | "skipped";
@@ -22,8 +23,10 @@ export function Cook({
   recipeSource?: string;
 }) {
   const { t } = useTranslation();
-  const { instanceId, isRemote, discordGuildChannels } = useInstance();
+  const ua = useApi();
+  const { instanceId, isRemote } = useInstance();
   const [recipe, setRecipe] = useState<Recipe | null>(null);
+  const [loading, setLoading] = useState(true);
   const [params, setParams] = useState<Record<string, string>>({});
   const [phase, setPhase] = useState<Phase>("params");
   const [resolvedStepList, setResolvedStepList] = useState<ResolvedStep[]>([]);
@@ -32,7 +35,8 @@ export function Cook({
   const [needsRestart, setNeedsRestart] = useState(false);
 
   useEffect(() => {
-    api.listRecipes(recipeSource).then((recipes) => {
+    setLoading(true);
+    ua.listRecipes(recipeSource).then((recipes) => {
       const found = recipes.find((it) => it.id === recipeId);
       setRecipe(found || null);
       if (found) {
@@ -42,7 +46,7 @@ export function Cook({
         }
         setParams(defaults);
       }
-    });
+    }).finally(() => setLoading(false));
   }, [recipeId, recipeSource]);
 
   // Pre-populate fields from existing config when channel is selected
@@ -79,9 +83,7 @@ export function Cook({
 
     if (Object.keys(configPaths).length === 0) return;
 
-    const readConfig = isRemote
-      ? api.remoteReadRawConfig(instanceId)
-      : api.readRawConfig();
+    const readConfig = ua.readRawConfig();
 
     readConfig.then((raw) => {
       try {
@@ -93,14 +95,18 @@ export function Cook({
             if (cur && typeof cur === "object") cur = (cur as Record<string, unknown>)[part];
             else { cur = undefined; break; }
           }
-          if (typeof cur === "string" && cur.length > 0) {
-            setParams((prev) => ({ ...prev, [paramId]: prev[paramId] || cur as string }));
+          if (typeof cur === "string") {
+            setParams((prev) => ({ ...prev, [paramId]: cur as string }));
+          } else {
+            // Clear param when config value is absent (e.g. channel has no persona)
+            setParams((prev) => ({ ...prev, [paramId]: "" }));
           }
         }
       } catch { /* ignore */ }
     }).catch(() => { /* ignore config read errors */ });
   }, [recipe, params.guild_id, params.channel_id, isRemote, instanceId]);
 
+  if (loading) return <div className="flex items-center justify-center py-12"><div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" /></div>;
   if (!recipe) return <div>{t('cook.recipeNotFound')}</div>;
 
   const handleNext = () => {
@@ -119,7 +125,10 @@ export function Cook({
       statuses[i] = "running";
       setStepStatuses([...statuses]);
       try {
-        await executeStep(resolvedStepList[i], { instanceId, isRemote });
+        const commands = await stepToCommands(resolvedStepList[i], { instanceId, isRemote });
+        for (const [label, cmd] of commands) {
+          await ua.queueCommand(label, cmd);
+        }
         statuses[i] = "done";
       } catch (err) {
         statuses[i] = "failed";

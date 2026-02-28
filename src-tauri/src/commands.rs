@@ -5,22 +5,79 @@ use std::{fs, process::Command, time::{SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::config_io::{ensure_dirs, read_openclaw_config, write_json, write_text};
 use crate::doctor::{apply_auto_fixes, run_doctor, DoctorReport};
 use crate::history::{add_snapshot, list_snapshots, read_snapshot};
 use crate::models::resolve_paths;
 use crate::ssh::{SshConnectionPool, SshHostConfig, SshExecResult, SftpEntry};
-use std::sync::Mutex;
 
-/// Stores remote config baselines keyed by host_id for dirty tracking.
-pub struct RemoteConfigBaselines(Mutex<HashMap<String, String>>);
+/// Escape a string for safe inclusion in a single-quoted shell argument.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
-impl RemoteConfigBaselines {
-    pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
-    }
+/// Resolve the `openclaw` binary path, with fallback probing for common locations.
+/// `fix_path_env::fix()` in main.rs patches PATH from the user's login shell, but
+/// it silently fails on some setups. This function caches the resolved path for the
+/// lifetime of the process.
+pub(crate) fn resolve_openclaw_bin() -> &'static str {
+    use std::sync::OnceLock;
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        // First: check if "openclaw" is already in PATH (fix_path_env worked)
+        if find_in_path("openclaw") {
+            return "openclaw".to_string();
+        }
+        // Fallback: probe well-known locations
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates = [
+            "/opt/homebrew/bin/openclaw".to_string(),
+            "/usr/local/bin/openclaw".to_string(),
+            format!("{home}/.npm-global/bin/openclaw"),
+            format!("{home}/.local/bin/openclaw"),
+        ];
+        // Also probe nvm directories (any node version)
+        let nvm_dir = std::env::var("NVM_DIR")
+            .unwrap_or_else(|_| format!("{home}/.nvm"));
+        let nvm_pattern = format!("{nvm_dir}/versions/node");
+        let mut nvm_candidates = Vec::new();
+        if let Ok(entries) = fs::read_dir(&nvm_pattern) {
+            for entry in entries.flatten() {
+                let p = entry.path().join("bin/openclaw");
+                if p.exists() {
+                    nvm_candidates.push(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        for candidate in candidates.iter().chain(nvm_candidates.iter()) {
+            if Path::new(candidate).is_file() {
+                // Prepend its directory to PATH so child processes benefit.
+                // Called exactly once via OnceLock, before other threads read PATH.
+                if let Some(dir) = Path::new(candidate).parent() {
+                    if let Ok(current_path) = std::env::var("PATH") {
+                        let dir_str = dir.to_string_lossy();
+                        let already_in_path = std::env::split_paths(&current_path)
+                            .any(|p| p == Path::new(dir_str.as_ref()));
+                        if !already_in_path {
+                            std::env::set_var("PATH", format!("{dir_str}:{current_path}"));
+                        }
+                    }
+                }
+                return candidate.clone();
+            }
+        }
+        // Last resort: return bare name and let the OS error propagate
+        "openclaw".to_string()
+    })
+}
+
+/// Check if a binary exists in PATH without executing it.
+fn find_in_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 use crate::recipe::{
@@ -71,12 +128,100 @@ pub struct ModelCatalogProviderCache {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenclawCommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+impl From<crate::cli_runner::CliOutput> for OpenclawCommandOutput {
+    fn from(value: crate::cli_runner::CliOutput) -> Self {
+        Self {
+            stdout: value.stdout,
+            stderr: value.stderr,
+            exit_code: value.exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescueBotCommandResult {
+    pub command: Vec<String>,
+    pub output: OpenclawCommandOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescueBotManageResult {
+    pub action: String,
+    pub profile: String,
+    pub main_port: u16,
+    pub rescue_port: u16,
+    pub min_recommended_port: u16,
+    pub was_already_configured: bool,
+    pub commands: Vec<RescueBotCommandResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescuePrimaryCheckItem {
+    pub id: String,
+    pub title: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescuePrimaryIssue {
+    pub id: String,
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    pub auto_fixable: bool,
+    pub fix_hint: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescuePrimaryDiagnosisResult {
+    pub status: String,
+    pub checked_at: String,
+    pub target_profile: String,
+    pub rescue_profile: String,
+    pub rescue_configured: bool,
+    pub rescue_port: Option<u16>,
+    pub checks: Vec<RescuePrimaryCheckItem>,
+    pub issues: Vec<RescuePrimaryIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescuePrimaryRepairStep {
+    pub id: String,
+    pub title: String,
+    pub ok: bool,
+    pub detail: String,
+    pub command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescuePrimaryRepairResult {
+    pub attempted_at: String,
+    pub target_profile: String,
+    pub rescue_profile: String,
+    pub selected_issue_ids: Vec<String>,
+    pub applied_issue_ids: Vec<String>,
+    pub skipped_issue_ids: Vec<String>,
+    pub failed_issue_ids: Vec<String>,
+    pub steps: Vec<RescuePrimaryRepairStep>,
+    pub before: RescuePrimaryDiagnosisResult,
+    pub after: RescuePrimaryDiagnosisResult,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,14 +281,6 @@ pub struct MemorySummary {
     pub file_count: usize,
     pub total_bytes: u64,
     pub files: Vec<MemoryFileSummary>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryFile {
-    pub path: String,
-    pub relative_path: String,
-    pub size_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -320,37 +457,85 @@ pub struct StatusLight {
     pub healthy: bool,
     pub active_agents: u32,
     pub global_default_model: Option<String>,
+    pub fallback_models: Vec<String>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusExtra {
+    pub openclaw_version: Option<String>,
+    pub duplicate_installs: Vec<String>,
+}
+
+/// Clear cached openclaw version — call after upgrade so status shows new version.
+pub fn clear_openclaw_version_cache() {
+    *OPENCLAW_VERSION_CACHE.lock().unwrap() = None;
+}
+
+static OPENCLAW_VERSION_CACHE: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
 /// Fast status: reads config + quick TCP probe of gateway port.
 #[tauri::command]
 pub fn get_status_light() -> Result<StatusLight, String> {
+
     let paths = resolve_paths();
     let cfg = read_openclaw_config(&paths)?;
-    let active_agents = cfg
+    let explicit_count = cfg
         .get("agents")
         .and_then(|a| a.get("list"))
         .and_then(|a| a.as_array())
         .map(|a| a.len() as u32)
         .unwrap_or(0);
+    // At least 1 agent (implicit "main") when agents section exists
+    let active_agents = if explicit_count == 0 && cfg.get("agents").is_some() { 1 } else { explicit_count };
     let global_default_model = cfg
         .pointer("/agents/defaults/model")
         .and_then(read_model_value)
         .or_else(|| cfg.pointer("/agents/default/model").and_then(read_model_value));
 
+    let fallback_models = cfg
+        .pointer("/agents/defaults/model/fallbacks")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default();
+
     // Quick gateway health: TCP connect to gateway port
     let gateway_port = cfg.pointer("/gateway/port")
         .and_then(Value::as_u64)
-        .unwrap_or(8080) as u16;
+        .unwrap_or(18789) as u16;
     let healthy = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], gateway_port)),
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(200),
     ).is_ok();
 
     Ok(StatusLight {
         healthy,
         active_agents,
         global_default_model,
+        fallback_models,
+    })
+}
+
+/// Local status extra: openclaw version (cached) + no duplicate detection needed locally.
+#[tauri::command]
+pub fn get_status_extra() -> Result<StatusExtra, String> {
+    let openclaw_version = {
+        let mut cache = OPENCLAW_VERSION_CACHE.lock().unwrap();
+        if cache.is_none() {
+            *cache = Some(
+                std::process::Command::new(resolve_openclaw_bin())
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            );
+        }
+        cache.as_ref().unwrap().clone()
+    };
+    Ok(StatusExtra {
+        openclaw_version,
+        duplicate_installs: Vec::new(),
     })
 }
 
@@ -359,10 +544,12 @@ pub fn get_status_light() -> Result<StatusLight, String> {
 pub fn get_cached_model_catalog() -> Result<Vec<ModelCatalogProvider>, String> {
     let paths = resolve_paths();
     let cache_path = model_catalog_cache_path(&paths);
-    if let Some(cached) = read_model_catalog_cache(&cache_path) {
-        if cached.error.is_none() && !cached.providers.is_empty() {
-            return Ok(cached.providers);
-        }
+    let current_version = resolve_openclaw_version();
+    if let Some(catalog) = select_catalog_from_cache(
+        read_model_catalog_cache(&cache_path).as_ref(),
+        &current_version,
+    ) {
+        return Ok(catalog);
     }
     Ok(Vec::new())
 }
@@ -371,8 +558,7 @@ pub fn get_cached_model_catalog() -> Result<Vec<ModelCatalogProvider>, String> {
 #[tauri::command]
 pub fn refresh_model_catalog() -> Result<Vec<ModelCatalogProvider>, String> {
     let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    load_model_catalog(&paths, &cfg)
+    load_model_catalog(&paths)
 }
 
 #[tauri::command]
@@ -421,13 +607,6 @@ pub fn get_system_status() -> Result<SystemStatus, String> {
 pub fn list_model_profiles() -> Result<Vec<ModelProfile>, String> {
     let paths = resolve_paths();
     Ok(load_model_profiles(&paths))
-}
-
-#[tauri::command]
-pub fn list_model_catalog() -> Result<Vec<ModelCatalogProvider>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    load_model_catalog(&paths, &cfg)
 }
 
 #[tauri::command]
@@ -625,20 +804,33 @@ pub fn resolve_provider_auth(provider: String) -> Result<ProviderAuthSuggestion,
 }
 
 #[tauri::command]
-pub fn list_channels() -> Result<Vec<ChannelNode>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    let mut nodes = collect_channel_nodes(&cfg);
-    enrich_channel_display_names(&paths, &cfg, &mut nodes)?;
-    Ok(nodes)
+pub async fn list_channels() -> Result<Vec<ChannelNode>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let paths = resolve_paths();
+        let cfg = read_openclaw_config(&paths)?;
+        let mut nodes = collect_channel_nodes(&cfg);
+        enrich_channel_display_names(&paths, &cfg, &mut nodes)?;
+        Ok(nodes)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub fn list_channels_minimal() -> Result<Vec<ChannelNode>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    let nodes = collect_channel_nodes(&cfg);
-    Ok(nodes)
+    let output = crate::cli_runner::run_openclaw(&["config", "get", "channels", "--json"])
+        .map_err(|e| format!("Failed to run openclaw: {e}"))?;
+    if output.exit_code != 0 {
+        let msg = format!("{} {}", output.stderr, output.stdout).to_lowercase();
+        if msg.contains("not found") {
+            return Ok(Vec::new());
+        }
+        // Fallback: direct read
+        let paths = resolve_paths();
+        let cfg = read_openclaw_config(&paths)?;
+        return Ok(collect_channel_nodes(&cfg));
+    }
+    let channels_val = crate::cli_runner::parse_json_output(&output).unwrap_or(Value::Null);
+    let cfg = serde_json::json!({ "channels": channels_val });
+    Ok(collect_channel_nodes(&cfg))
 }
 
 /// Read Discord guild/channels from persistent cache. Fast, no subprocess.
@@ -662,25 +854,42 @@ pub async fn refresh_discord_guild_channels() -> Result<Vec<DiscordGuildChannel>
         ensure_dirs(&paths)?;
         let cfg = read_openclaw_config(&paths)?;
 
-        // Extract bot token for Discord API calls
-        let bot_token = cfg
-            .pointer("/channels/discord/botToken")
-            .or_else(|| cfg.pointer("/channels/discord/token"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-
-        let guilds = cfg
+        let discord_cfg = cfg
             .get("channels")
-            .and_then(|c| c.get("discord"))
+            .and_then(|c| c.get("discord"));
+        let configured_single_guild_id = discord_cfg
             .and_then(|d| d.get("guilds"))
-            .and_then(Value::as_object);
+            .and_then(Value::as_object)
+            .and_then(|guilds| {
+                if guilds.len() == 1 {
+                    guilds.keys().next().cloned()
+                } else {
+                    None
+                }
+            });
+
+        // Extract bot token: top-level first, then fall back to first account token
+        let bot_token = discord_cfg
+            .and_then(|d| d.get("botToken").or_else(|| d.get("token")))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .or_else(|| {
+                discord_cfg
+                    .and_then(|d| d.get("accounts"))
+                    .and_then(Value::as_object)
+                    .and_then(|accounts| {
+                        accounts.values().find_map(|acct| {
+                            acct.get("token").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|s| s.to_string())
+                        })
+                    })
+            });
 
         let mut entries: Vec<DiscordGuildChannel> = Vec::new();
         let mut channel_ids: Vec<String> = Vec::new();
         let mut unresolved_guild_ids: Vec<String> = Vec::new();
 
-        // Collect from channels.discord.guilds (structured config)
-        if let Some(guilds) = guilds {
+        // Helper: collect guilds from a guilds object
+        let mut collect_guilds = |guilds: &serde_json::Map<String, Value>| {
             for (guild_id, guild_val) in guilds {
                 let guild_name = guild_val
                     .get("slug")
@@ -690,12 +899,19 @@ pub async fn refresh_discord_guild_channels() -> Result<Vec<DiscordGuildChannel>
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| guild_id.clone());
 
-                if guild_name == *guild_id {
+                if guild_name == *guild_id && !unresolved_guild_ids.contains(guild_id) {
                     unresolved_guild_ids.push(guild_id.clone());
                 }
 
                 if let Some(channels) = guild_val.get("channels").and_then(Value::as_object) {
                     for (channel_id, _channel_val) in channels {
+                        // Skip glob/wildcard patterns (e.g. "*") — not real channel IDs
+                        if channel_id.contains('*') || channel_id.contains('?') {
+                            continue;
+                        }
+                        if entries.iter().any(|e| e.guild_id == *guild_id && e.channel_id == *channel_id) {
+                            continue;
+                        }
                         channel_ids.push(channel_id.clone());
                         entries.push(DiscordGuildChannel {
                             guild_id: guild_id.clone(),
@@ -706,7 +922,23 @@ pub async fn refresh_discord_guild_channels() -> Result<Vec<DiscordGuildChannel>
                     }
                 }
             }
+        };
+
+        // Collect from channels.discord.guilds (top-level structured config)
+        if let Some(guilds) = discord_cfg.and_then(|d| d.get("guilds")).and_then(Value::as_object) {
+            collect_guilds(guilds);
         }
+
+        // Collect from channels.discord.accounts.<accountId>.guilds (multi-account config)
+        if let Some(accounts) = discord_cfg.and_then(|d| d.get("accounts")).and_then(Value::as_object) {
+            for (_account_id, account_val) in accounts {
+                if let Some(guilds) = account_val.get("guilds").and_then(Value::as_object) {
+                    collect_guilds(guilds);
+                }
+            }
+        }
+
+        drop(collect_guilds); // Release mutable borrows before bindings section
 
         // Also collect from bindings array (users may only have bindings, no guilds map)
         if let Some(bindings) = cfg.get("bindings").and_then(Value::as_array) {
@@ -742,6 +974,61 @@ pub async fn refresh_discord_guild_channels() -> Result<Vec<DiscordGuildChannel>
                     channel_id: channel_id.clone(),
                     channel_name: channel_id.clone(),
                 });
+            }
+        }
+
+        // Fallback A: if we have token + guild ids, fetch channels from Discord REST directly.
+        // This avoids hard-failing when CLI rejects config due non-critical schema drift.
+        if channel_ids.is_empty() {
+            let configured_guild_ids = collect_discord_config_guild_ids(discord_cfg);
+            if let Some(token) = &bot_token {
+                for guild_id in &configured_guild_ids {
+                    if let Ok(channels) = fetch_discord_guild_channels(token, guild_id) {
+                        for (channel_id, channel_name) in channels {
+                            if entries.iter().any(|e| e.guild_id == *guild_id && e.channel_id == channel_id) {
+                                continue;
+                            }
+                            channel_ids.push(channel_id.clone());
+                            entries.push(DiscordGuildChannel {
+                                guild_id: guild_id.clone(),
+                                guild_name: guild_id.clone(),
+                                channel_id,
+                                channel_name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback B: query channel ids from directory and keep compatibility
+        // with existing cache shape when config has no explicit channel map.
+        if channel_ids.is_empty() {
+            if let Ok(output) = run_openclaw_raw(&[
+                "directory",
+                "groups",
+                "list",
+                "--channel",
+                "discord",
+                "--json",
+            ]) {
+                for channel_id in parse_directory_group_channel_ids(&output.stdout) {
+                    if entries.iter().any(|e| e.channel_id == channel_id) {
+                        continue;
+                    }
+                    let (guild_id, guild_name) = if let Some(gid) = configured_single_guild_id.clone() {
+                        (gid.clone(), gid)
+                    } else {
+                        ("discord".to_string(), "Discord".to_string())
+                    };
+                    channel_ids.push(channel_id.clone());
+                    entries.push(DiscordGuildChannel {
+                        guild_id,
+                        guild_name,
+                        channel_id: channel_id.clone(),
+                        channel_name: channel_id,
+                    });
+                }
             }
         }
 
@@ -824,79 +1111,30 @@ pub fn update_channel_config(
 
 /// List current channel→agent bindings from config.
 #[tauri::command]
-pub fn list_bindings() -> Result<Vec<Value>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    let bindings = cfg
-        .get("bindings")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(bindings)
-}
-
-/// Assign a Discord channel to an agent (modifies the `bindings` array).
-/// Pass `agent_id = None` or empty to remove the binding (revert to default agent).
-#[tauri::command]
-pub fn assign_channel_agent(
-    channel_type: String,
-    peer_id: String,
-    agent_id: Option<String>,
-) -> Result<bool, String> {
-    let paths = resolve_paths();
-    let mut cfg = read_openclaw_config(&paths)?;
-    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    let bindings = cfg
-        .get_mut("bindings")
-        .and_then(Value::as_array_mut);
-
-    let agent_id = agent_id
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    if let Some(arr) = bindings {
-        // Remove existing binding for this peer
-        arr.retain(|b| {
-            let m = b.get("match");
-            let ch = m.and_then(|m| m.get("channel")).and_then(Value::as_str);
-            let pid = m.and_then(|m| m.pointer("/peer/id")).and_then(Value::as_str);
-            !(ch == Some(&channel_type) && pid == Some(&peer_id))
-        });
-
-        // Add new binding if agent_id is provided
-        if let Some(ref aid) = agent_id {
-            arr.push(serde_json::json!({
-                "agentId": aid,
-                "match": {
-                    "channel": channel_type,
-                    "peer": {
-                        "id": peer_id,
-                        "kind": "channel"
-                    }
-                }
-            }));
-        }
-    } else if let Some(ref aid) = agent_id {
-        // No bindings array yet — create one
-        cfg.as_object_mut()
-            .ok_or("config is not an object")?
-            .insert("bindings".into(), serde_json::json!([
-                {
-                    "agentId": aid,
-                    "match": {
-                        "channel": channel_type,
-                        "peer": {
-                            "id": peer_id,
-                            "kind": "channel"
-                        }
-                    }
-                }
-            ]));
+pub async fn list_bindings(
+    cache: tauri::State<'_, crate::cli_runner::CliCache>,
+) -> Result<Vec<Value>, String> {
+    let cache_key = "local:bindings";
+    if let Some(cached) = cache.get(cache_key, None) {
+        return serde_json::from_str(&cached).map_err(|e| e.to_string());
     }
-
-    write_config_with_snapshot(&paths, &current, &cfg, "assign-channel-agent")?;
-    Ok(true)
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = crate::cli_runner::run_openclaw(&["config", "get", "bindings", "--json"])?;
+        // "bindings" may not exist yet — treat "not found" as empty
+        if output.exit_code != 0 {
+            let msg = format!("{} {}", output.stderr, output.stdout).to_lowercase();
+            if msg.contains("not found") {
+                return Ok(Vec::new());
+            }
+        }
+        let json = crate::cli_runner::parse_json_output(&output)?;
+        let result = json.as_array().cloned().unwrap_or_default();
+        if let Ok(serialized) = serde_json::to_string(&result) {
+            cache.set(cache_key.to_string(), serialized);
+        }
+        Ok(result)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -917,11 +1155,23 @@ pub fn delete_channel_node(path: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn set_global_model(profile_id: Option<String>) -> Result<bool, String> {
+pub fn set_global_model(model_value: Option<String>) -> Result<bool, String> {
     let paths = resolve_paths();
     let mut cfg = read_openclaw_config(&paths)?;
     let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let model = resolve_profile_model_value(&paths, profile_id)?;
+    let model = model_value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    // If existing model is an object (has fallbacks etc.), only update "primary" inside it
+    if let Some(existing) = cfg.pointer_mut("/agents/defaults/model") {
+        if let Some(model_obj) = existing.as_object_mut() {
+            match model {
+                Some(v) => { model_obj.insert("primary".into(), Value::String(v)); }
+                None => { model_obj.remove("primary"); }
+            }
+            write_config_with_snapshot(&paths, &current, &cfg, "set-global-model")?;
+            return Ok(true);
+        }
+    }
+    // Fallback: plain string or missing — set the whole value
     set_nested_value(
         &mut cfg,
         "agents.defaults.model",
@@ -932,28 +1182,28 @@ pub fn set_global_model(profile_id: Option<String>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn set_agent_model(agent_id: String, profile_id: Option<String>) -> Result<bool, String> {
+pub fn set_agent_model(agent_id: String, model_value: Option<String>) -> Result<bool, String> {
     if agent_id.trim().is_empty() {
         return Err("agent id is required".into());
     }
     let paths = resolve_paths();
     let mut cfg = read_openclaw_config(&paths)?;
     let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let value = resolve_profile_model_value(&paths, profile_id)?;
+    let value = model_value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     set_agent_model_value(&mut cfg, &agent_id, value)?;
     write_config_with_snapshot(&paths, &current, &cfg, "set-agent-model")?;
     Ok(true)
 }
 
 #[tauri::command]
-pub fn set_channel_model(path: String, profile_id: Option<String>) -> Result<bool, String> {
+pub fn set_channel_model(path: String, model_value: Option<String>) -> Result<bool, String> {
     if path.trim().is_empty() {
         return Err("channel path is required".into());
     }
     let paths = resolve_paths();
     let mut cfg = read_openclaw_config(&paths)?;
     let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let value = resolve_profile_model_value(&paths, profile_id)?;
+    let value = model_value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     set_nested_value(&mut cfg, &format!("{path}.model"), value.map(Value::String))?;
     write_config_with_snapshot(&paths, &current, &cfg, "set-channel-model")?;
     Ok(true)
@@ -968,58 +1218,71 @@ pub fn list_model_bindings() -> Result<Vec<ModelBinding>, String> {
 }
 
 #[tauri::command]
-pub fn list_agent_ids() -> Result<Vec<String>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    Ok(collect_agent_ids(&cfg))
+pub async fn list_agents_overview(
+    cache: tauri::State<'_, crate::cli_runner::CliCache>,
+) -> Result<Vec<AgentOverview>, String> {
+    let cache_key = "local:agents-list";
+    if let Some(cached) = cache.get(cache_key, None) {
+        return serde_json::from_str(&cached).map_err(|e| e.to_string());
+    }
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = crate::cli_runner::run_openclaw(&["agents", "list", "--json"])?;
+        let json = crate::cli_runner::parse_json_output(&output)?;
+        let result = parse_agents_cli_output(&json, None)?;
+        if let Ok(serialized) = serde_json::to_string(&result) {
+            cache.set(cache_key.to_string(), serialized);
+        }
+        Ok(result)
+    }).await.map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn list_agents_overview() -> Result<Vec<AgentOverview>, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
+/// Check if an agent has active sessions by examining sessions/sessions.json.
+/// Returns true if the file exists and is larger than 2 bytes (i.e. not just "{}").
+fn agent_has_sessions(base_dir: &std::path::Path, agent_id: &str) -> bool {
+    let sessions_file = base_dir.join("agents").join(agent_id).join("sessions").join("sessions.json");
+    match std::fs::metadata(&sessions_file) {
+        Ok(m) => m.len() > 2, // "{}" is 2 bytes = empty
+        Err(_) => false,
+    }
+}
+
+/// Parse the JSON output of `openclaw agents list --json` into Vec<AgentOverview>.
+/// `online_set`: if Some, use it to determine online status; if None, check local sessions.
+fn parse_agents_cli_output(json: &Value, online_set: Option<&std::collections::HashSet<String>>) -> Result<Vec<AgentOverview>, String> {
+    let arr = json.as_array().ok_or("agents list output is not an array")?;
+    let paths = if online_set.is_none() { Some(resolve_paths()) } else { None };
     let mut agents = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-
-    let default_workspace = cfg.pointer("/agents/defaults/workspace")
-        .and_then(Value::as_str)
-        .map(|s| expand_tilde(s));
-
-    if let Some(list) = cfg.pointer("/agents/list").and_then(Value::as_array) {
-        let channel_nodes = collect_channel_nodes(&cfg);
-        for agent in list {
-            let id = agent.get("id").and_then(Value::as_str).unwrap_or("agent").to_string();
-
-            // Deduplicate by ID
-            if !seen_ids.insert(id.clone()) {
-                continue;
-            }
-
-            // Read name/emoji from IDENTITY.md in the agent's workspace
-            let workspace = agent.get("workspace").and_then(Value::as_str)
-                .map(|s| expand_tilde(s))
-                .or_else(|| default_workspace.clone());
-            let (name, emoji) = workspace.as_ref()
-                .and_then(|ws| parse_identity_md(ws))
-                .unwrap_or((None, None));
-
-            let model = agent.get("model").and_then(read_model_value)
-                .or_else(|| cfg.pointer("/agents/defaults/model").and_then(read_model_value))
-                .or_else(|| cfg.pointer("/agents/default/model").and_then(read_model_value));
-            let channels: Vec<String> = channel_nodes.iter()
-                .map(|ch| ch.path.clone())
-                .collect();
-            let has_sessions = paths.base_dir.join("agents").join(&id).join("sessions").exists();
-            agents.push(AgentOverview {
-                id,
-                name,
-                emoji,
-                model,
-                channels,
-                online: has_sessions,
-                workspace,
-            });
-        }
+    for entry in arr {
+        let id = entry.get("id").and_then(Value::as_str).unwrap_or("main").to_string();
+        let name = entry.get("identityName").and_then(Value::as_str).map(|s| s.to_string());
+        let emoji = entry.get("identityEmoji").and_then(Value::as_str).map(|s| s.to_string());
+        let model = entry.get("model").and_then(Value::as_str).map(|s| s.to_string());
+        let workspace = entry.get("workspace").and_then(Value::as_str).map(|s| s.to_string());
+        let online = match online_set {
+            Some(set) => set.contains(&id),
+            None => agent_has_sessions(paths.as_ref().unwrap().base_dir.as_path(), &id),
+        };
+        agents.push(AgentOverview {
+            id,
+            name,
+            emoji,
+            model,
+            channels: Vec::new(),
+            online,
+            workspace,
+        });
+    }
+    if agents.is_empty() {
+        agents.push(AgentOverview {
+            id: "main".into(),
+            name: None,
+            emoji: None,
+            model: None,
+            channels: Vec::new(),
+            online: false,
+            workspace: None,
+        });
     }
     Ok(agents)
 }
@@ -1027,7 +1290,7 @@ pub fn list_agents_overview() -> Result<Vec<AgentOverview>, String> {
 #[tauri::command]
 pub fn create_agent(
     agent_id: String,
-    model_profile_id: Option<String>,
+    model_value: Option<String>,
     independent: Option<bool>,
 ) -> Result<AgentOverview, String> {
     let agent_id = agent_id.trim().to_string();
@@ -1047,14 +1310,7 @@ pub fn create_agent(
         return Err(format!("Agent '{}' already exists", agent_id));
     }
 
-    // Resolve model value from profile if provided
-    let model_value = if let Some(ref pid) = model_profile_id {
-        let pid = pid.trim();
-        if pid.is_empty() { None } else {
-            Some(resolve_profile_model_value(&paths, Some(pid.to_string()))?)
-        }
-    } else { None };
-    let model_display = model_value.flatten();
+    let model_display = model_value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
 
     // If independent, create a dedicated workspace directory;
     // otherwise inherit the default workspace so the gateway doesn't auto-create one.
@@ -1206,6 +1462,62 @@ pub fn setup_agent_identity(
     Ok(true)
 }
 
+#[tauri::command]
+pub async fn remote_setup_agent_identity(
+    pool: State<'_, SshConnectionPool>,
+    host_id: String,
+    agent_id: String,
+    name: String,
+    emoji: Option<String>,
+) -> Result<bool, String> {
+    let agent_id = agent_id.trim().to_string();
+    let name = name.trim().to_string();
+    if agent_id.is_empty() {
+        return Err("Agent ID is required".into());
+    }
+    if name.is_empty() {
+        return Err("Name is required".into());
+    }
+
+    // Read remote config to find agent workspace
+    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
+    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse config: {e}"))?;
+
+    let agents_list = cfg.pointer("/agents/list")
+        .and_then(Value::as_array)
+        .ok_or("agents.list not found")?;
+
+    let agent = agents_list.iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(&agent_id))
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+
+    let default_workspace = cfg.pointer("/agents/defaults/workspace")
+        .or_else(|| cfg.pointer("/agents/default/workspace"))
+        .and_then(Value::as_str)
+        .unwrap_or("~/.openclaw/agents");
+
+    let workspace = agent.get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or(default_workspace);
+
+    // Build IDENTITY.md content
+    let mut content = format!("- Name: {}\n", name);
+    if let Some(ref e) = emoji {
+        let e = e.trim();
+        if !e.is_empty() {
+            content.push_str(&format!("- Emoji: {}\n", e));
+        }
+    }
+
+    // Write via SSH
+    let ws = if workspace.starts_with("~/") { workspace.to_string() } else { format!("~/{workspace}") };
+    pool.exec(&host_id, &format!("mkdir -p {}", shell_escape(&ws))).await?;
+    let identity_path = format!("{}/IDENTITY.md", ws);
+    pool.sftp_write(&host_id, &identity_path, &content).await?;
+
+    Ok(true)
+}
+
 fn expand_tilde(path: &str) -> String {
     if path.starts_with("~/") {
         if let Some(home) = std::env::var("HOME").ok() {
@@ -1215,68 +1527,6 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-fn parse_identity_content(content: &str) -> (Option<String>, Option<String>) {
-    let mut name = None;
-    let mut emoji = None;
-    for line in content.lines() {
-        let trimmed = line.trim().trim_start_matches('-').trim();
-        // Handle both "Name: X" and "**Name:** X"
-        let trimmed = trimmed.replace("**", "");
-        if let Some(val) = trimmed.strip_prefix("Name:") {
-            let val = val.trim();
-            if !val.is_empty() {
-                name = Some(val.to_string());
-            }
-        } else if let Some(val) = trimmed.strip_prefix("Emoji:") {
-            let val = val.trim();
-            if !val.is_empty() {
-                emoji = Some(val.to_string());
-            }
-        }
-    }
-    (name, emoji)
-}
-
-fn parse_identity_md(workspace: &str) -> Option<(Option<String>, Option<String>)> {
-    let identity_path = std::path::Path::new(workspace).join("IDENTITY.md");
-    let content = fs::read_to_string(&identity_path).ok()?;
-    Some(parse_identity_content(&content))
-}
-
-#[tauri::command]
-pub fn list_memory_files() -> Result<Vec<MemoryFile>, String> {
-    let paths = resolve_paths();
-    list_memory_files_detailed(&paths.base_dir.join("memory"))
-}
-
-#[tauri::command]
-pub fn delete_memory_file(path: String) -> Result<bool, String> {
-    let paths = resolve_paths();
-    let root = paths.base_dir.join("memory");
-    let target = resolve_child_path(&root, &path)?;
-    if !target.exists() {
-        return Ok(false);
-    }
-    if !target.is_file() {
-        return Err("target is not a file".into());
-    }
-    fs::remove_file(&target).map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub fn clear_memory() -> Result<usize, String> {
-    let paths = resolve_paths();
-    let root = paths.base_dir.join("memory");
-    if !root.exists() {
-        return Ok(0);
-    }
-    let count = count_files_recursive(&root);
-    fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    Ok(count)
-}
-
 #[tauri::command]
 pub fn list_session_files() -> Result<Vec<SessionFile>, String> {
     let paths = resolve_paths();
@@ -1284,35 +1534,9 @@ pub fn list_session_files() -> Result<Vec<SessionFile>, String> {
 }
 
 #[tauri::command]
-pub fn delete_session_file(path: String) -> Result<bool, String> {
-    let paths = resolve_paths();
-    let target = resolve_child_path(&paths.base_dir, &path)?;
-    if !target.exists() {
-        return Ok(false);
-    }
-    if !target.is_file() {
-        return Err("target is not a file".into());
-    }
-    fs::remove_file(&target).map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
 pub fn clear_all_sessions() -> Result<usize, String> {
     let paths = resolve_paths();
     clear_agent_and_global_sessions(&paths.base_dir.join("agents"), None)
-}
-
-#[tauri::command]
-pub fn clear_agent_sessions(agent_id: String) -> Result<usize, String> {
-    if agent_id.trim().is_empty() {
-        return Err("agent id is required".into());
-    }
-    if agent_id.contains("..") || agent_id.contains('/') || agent_id.contains('\\') {
-        return Err("invalid agent id".into());
-    }
-    let paths = resolve_paths();
-    clear_agent_and_global_sessions(&paths.base_dir.join("agents"), Some(agent_id.as_str()))
 }
 
 #[tauri::command]
@@ -1706,6 +1930,123 @@ pub async fn restart_gateway() -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub async fn manage_rescue_bot(
+    action: String,
+    profile: Option<String>,
+    rescue_port: Option<u16>,
+) -> Result<RescueBotManageResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let action = RescueBotAction::parse(&action)?;
+        let profile = profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("rescue")
+            .to_string();
+
+        let main_port = read_openclaw_config(&resolve_paths())
+            .map(|cfg| resolve_gateway_port_from_config(&cfg))
+            .unwrap_or(18789);
+        let (already_configured, existing_port) = resolve_local_rescue_profile_state(&profile)?;
+        let should_configure = !already_configured || action == RescueBotAction::Set;
+        let rescue_port = if should_configure {
+            rescue_port.unwrap_or_else(|| suggest_rescue_port(main_port))
+        } else {
+            existing_port
+                .or(rescue_port)
+                .unwrap_or_else(|| suggest_rescue_port(main_port))
+        };
+        let min_recommended_port = main_port.saturating_add(20);
+
+        if should_configure && matches!(action, RescueBotAction::Set | RescueBotAction::Activate) {
+            ensure_rescue_port_spacing(main_port, rescue_port)?;
+        }
+
+        if action == RescueBotAction::Status && !already_configured {
+            return Ok(RescueBotManageResult {
+                action: action.as_str().into(),
+                profile,
+                main_port,
+                rescue_port,
+                min_recommended_port,
+                was_already_configured: false,
+                commands: Vec::new(),
+            });
+        }
+
+        let plan = build_rescue_bot_command_plan(action, &profile, rescue_port, should_configure);
+        let mut commands = Vec::new();
+
+        for command in plan {
+            let result = run_local_rescue_bot_command(command)?;
+            if result.output.exit_code != 0 {
+                if action == RescueBotAction::Status {
+                    commands.push(result);
+                    break;
+                }
+                if is_rescue_cleanup_noop(action, &result.command, &result.output) {
+                    commands.push(result);
+                    continue;
+                }
+                if action == RescueBotAction::Activate
+                    && is_gateway_restart_command(&result.command)
+                    && is_gateway_restart_timeout(&result.output)
+                {
+                    commands.push(result);
+                    run_local_gateway_restart_fallback(&profile, &mut commands)?;
+                    continue;
+                }
+                return Err(command_failure_message(&result.command, &result.output));
+            }
+            commands.push(result);
+        }
+
+        Ok(RescueBotManageResult {
+            action: action.as_str().into(),
+            profile,
+            main_port,
+            rescue_port,
+            min_recommended_port,
+            was_already_configured: already_configured,
+            commands,
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn diagnose_primary_via_rescue(
+    target_profile: Option<String>,
+    rescue_profile: Option<String>,
+) -> Result<RescuePrimaryDiagnosisResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target_profile = normalize_profile_name(target_profile.as_deref(), "primary");
+        let rescue_profile = normalize_profile_name(rescue_profile.as_deref(), "rescue");
+        diagnose_primary_via_rescue_local(&target_profile, &rescue_profile)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn repair_primary_via_rescue(
+    target_profile: Option<String>,
+    rescue_profile: Option<String>,
+    issue_ids: Option<Vec<String>>,
+) -> Result<RescuePrimaryRepairResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target_profile = normalize_profile_name(target_profile.as_deref(), "primary");
+        let rescue_profile = normalize_profile_name(rescue_profile.as_deref(), "rescue");
+        repair_primary_via_rescue_local(
+            &target_profile,
+            &rescue_profile,
+            issue_ids.unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub fn list_history(limit: usize, offset: usize) -> Result<HistoryPage, String> {
     let paths = resolve_paths();
     let index = list_snapshots(&paths.metadata_path)?;
@@ -1826,6 +2167,56 @@ pub fn fix_issues(ids: Vec<String>) -> Result<FixResult, String> {
     })
 }
 
+#[tauri::command]
+pub async fn remote_fix_issues(pool: State<'_, SshConnectionPool>, host_id: String, ids: Vec<String>) -> Result<FixResult, String> {
+    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
+    let mut cfg: Value = json5::from_str(&raw).unwrap_or_else(|_| Value::Object(Default::default()));
+    let mut applied = Vec::new();
+
+    for id in &ids {
+        match id.as_str() {
+            "field.agents" if cfg.get("agents").is_none() => {
+                let mut agents = serde_json::Map::new();
+                let mut defaults = serde_json::Map::new();
+                defaults.insert("model".into(), Value::String("anthropic/claude-sonnet-4-5".into()));
+                agents.insert("defaults".into(), Value::Object(defaults));
+                if let Value::Object(map) = &mut cfg {
+                    map.insert("agents".into(), Value::Object(agents));
+                }
+                applied.push(id.clone());
+            }
+            "json.syntax" => {
+                // If we got here, json5 already parsed it or fell back to empty object
+                applied.push(id.clone());
+            }
+            "field.port" => {
+                let mut gateway = cfg
+                    .get("gateway")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                gateway.insert("port".into(), Value::Number(serde_json::Number::from(18789_u64)));
+                if let Value::Object(map) = &mut cfg {
+                    map.insert("gateway".into(), Value::Object(gateway));
+                }
+                applied.push(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    if !applied.is_empty() {
+        remote_write_config_with_snapshot(&pool, &host_id, &raw, &cfg, "doctor-fix").await?;
+    }
+
+    let remaining: Vec<String> = ids.into_iter().filter(|id| !applied.contains(id)).collect();
+    Ok(FixResult {
+        ok: true,
+        applied,
+        remaining_issues: remaining,
+    })
+}
+
 fn collect_model_summary(cfg: &Value) -> ModelSummary {
     let global_default_model = cfg
         .pointer("/agents/defaults/model")
@@ -1857,31 +2248,1139 @@ fn collect_model_summary(cfg: &Value) -> ModelSummary {
     }
 }
 
-fn run_external_command_raw(parts: &[&str]) -> Result<OpenclawCommandOutput, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescueBotAction {
+    Set,
+    Activate,
+    Status,
+    Deactivate,
+    Unset,
+}
+
+impl RescueBotAction {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "set" | "configure" => Ok(Self::Set),
+            "activate" | "start" => Ok(Self::Activate),
+            "status" => Ok(Self::Status),
+            "deactivate" | "stop" => Ok(Self::Deactivate),
+            "unset" | "remove" | "delete" => Ok(Self::Unset),
+            _ => Err("action must be one of: set, activate, status, deactivate, unset".into()),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Activate => "activate",
+            Self::Status => "status",
+            Self::Deactivate => "deactivate",
+            Self::Unset => "unset",
+        }
+    }
+}
+
+fn normalize_profile_name(raw: Option<&str>, fallback: &str) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn build_profile_command(profile: &str, args: &[&str]) -> Vec<String> {
+    let mut command = vec!["--profile".to_string(), profile.to_string()];
+    command.extend(args.iter().map(|item| (*item).to_string()));
+    command
+}
+
+fn trim_for_detail(raw: &str) -> String {
+    let compact = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output");
+    let mut detail = compact.to_string();
+    const MAX_LEN: usize = 220;
+    if detail.chars().count() > MAX_LEN {
+        detail = detail.chars().take(MAX_LEN).collect::<String>();
+        detail.push('…');
+    }
+    detail
+}
+
+fn command_detail(output: &OpenclawCommandOutput) -> String {
+    if !output.stderr.trim().is_empty() {
+        return trim_for_detail(&output.stderr);
+    }
+    if !output.stdout.trim().is_empty() {
+        return trim_for_detail(&output.stdout);
+    }
+    "no output".into()
+}
+
+fn parse_json_loose(raw: &str) -> Option<Value> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(raw)
+        .ok()
+        .or_else(|| extract_json_from_output(raw).and_then(|json| serde_json::from_str(json).ok()))
+}
+
+fn normalize_issue_severity(raw: &str) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.contains("error") {
+        return "error".into();
+    }
+    if value.contains("warn") {
+        return "warn".into();
+    }
+    "info".into()
+}
+
+fn parse_doctor_issues(report: &Value, source: &str) -> Vec<RescuePrimaryIssue> {
+    let mut items = Vec::new();
+    let Some(issues) = report.get("issues").and_then(Value::as_array) else {
+        return items;
+    };
+    for (index, issue) in issues.iter().enumerate() {
+        let Some(obj) = issue.as_object() else {
+            continue;
+        };
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{source}.doctor.issue.{index}"));
+        let code = obj
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("doctor.issue")
+            .to_string();
+        let severity = normalize_issue_severity(
+            obj.get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("warn"),
+        );
+        let message = obj
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Doctor reported an issue")
+            .to_string();
+        let auto_fixable = obj
+            .get("autoFixable")
+            .and_then(Value::as_bool)
+            .or_else(|| obj.get("auto_fixable").and_then(Value::as_bool))
+            .unwrap_or(false);
+        let fix_hint = obj
+            .get("fixHint")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("fix_hint").and_then(Value::as_str))
+            .map(str::to_string);
+        items.push(RescuePrimaryIssue {
+            id,
+            code,
+            severity,
+            message,
+            auto_fixable,
+            fix_hint,
+            source: source.to_string(),
+        });
+    }
+    items
+}
+
+fn dedupe_rescue_primary_issues(issues: &mut Vec<RescuePrimaryIssue>) {
+    let mut seen = HashSet::new();
+    issues.retain(|issue| seen.insert(issue.id.clone()));
+}
+
+fn classify_rescue_primary_status(issues: &[RescuePrimaryIssue]) -> String {
+    if issues.iter().any(|issue| issue.severity == "error") {
+        return "broken".into();
+    }
+    if issues.is_empty() {
+        return "healthy".into();
+    }
+    "degraded".into()
+}
+
+fn summarize_gateway_status(status: &Value) -> Option<String> {
+    let running = status
+        .get("running")
+        .and_then(Value::as_bool)
+        .or_else(|| status.pointer("/gateway/running").and_then(Value::as_bool));
+    let healthy = status
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .or_else(|| status.pointer("/health/ok").and_then(Value::as_bool))
+        .or_else(|| status.pointer("/health/healthy").and_then(Value::as_bool));
+    let port = status
+        .get("port")
+        .and_then(Value::as_u64)
+        .or_else(|| status.pointer("/gateway/port").and_then(Value::as_u64));
+
+    let mut parts = Vec::new();
+    if let Some(value) = running {
+        parts.push(format!("running={value}"));
+    }
+    if let Some(value) = healthy {
+        parts.push(format!("healthy={value}"));
+    }
+    if let Some(value) = port {
+        parts.push(format!("port={value}"));
+    }
     if parts.is_empty() {
-        return Err("no command specified".into());
+        return None;
     }
-    let mut command = Command::new(parts[0]);
-    if parts.len() > 1 {
-        command.args(&parts[1..]);
+    Some(parts.join(", "))
+}
+
+fn gateway_output_ok(output: &OpenclawCommandOutput) -> bool {
+    if output.exit_code != 0 {
+        return false;
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("failed to run {}: {error}", parts[0]))?;
-    let exit_code = output.status.code().unwrap_or(-1);
-    Ok(OpenclawCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
-        exit_code,
+    let status = parse_json_loose(&output.stdout).or_else(|| parse_json_loose(&output.stderr));
+    let Some(status) = status else {
+        return true;
+    };
+    let running = status
+        .get("running")
+        .and_then(Value::as_bool)
+        .or_else(|| status.pointer("/gateway/running").and_then(Value::as_bool));
+    let healthy = status
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .or_else(|| status.pointer("/health/ok").and_then(Value::as_bool))
+        .or_else(|| status.pointer("/health/healthy").and_then(Value::as_bool));
+    !matches!(running, Some(false)) && !matches!(healthy, Some(false))
+}
+
+fn gateway_output_detail(output: &OpenclawCommandOutput) -> String {
+    parse_json_loose(&output.stdout)
+        .or_else(|| parse_json_loose(&output.stderr))
+        .and_then(|status| summarize_gateway_status(&status))
+        .unwrap_or_else(|| command_detail(output))
+}
+
+fn build_rescue_primary_diagnosis(
+    target_profile: &str,
+    rescue_profile: &str,
+    rescue_configured: bool,
+    rescue_port: Option<u16>,
+    rescue_gateway_status: Option<&OpenclawCommandOutput>,
+    primary_doctor_output: &OpenclawCommandOutput,
+    primary_gateway_status: &OpenclawCommandOutput,
+) -> RescuePrimaryDiagnosisResult {
+    let mut checks = Vec::new();
+    let mut issues = Vec::new();
+
+    checks.push(RescuePrimaryCheckItem {
+        id: "rescue.profile.configured".into(),
+        title: "Rescue profile configured".into(),
+        ok: rescue_configured,
+        detail: if rescue_configured {
+            rescue_port
+                .map(|port| format!("profile={rescue_profile}, port={port}"))
+                .unwrap_or_else(|| format!("profile={rescue_profile}, port unknown"))
+        } else {
+            format!("profile={rescue_profile} not configured")
+        },
+    });
+
+    if !rescue_configured {
+        issues.push(RescuePrimaryIssue {
+            id: "rescue.profile.missing".into(),
+            code: "rescue.profile.missing".into(),
+            severity: "error".into(),
+            message: format!("Rescue profile \"{rescue_profile}\" is not configured"),
+            auto_fixable: false,
+            fix_hint: Some("Activate Rescue Bot first".into()),
+            source: "rescue".into(),
+        });
+    }
+
+    if let Some(output) = rescue_gateway_status {
+        let ok = gateway_output_ok(output);
+        checks.push(RescuePrimaryCheckItem {
+            id: "rescue.gateway.status".into(),
+            title: "Rescue gateway status".into(),
+            ok,
+            detail: gateway_output_detail(output),
+        });
+        if !ok {
+            issues.push(RescuePrimaryIssue {
+                id: "rescue.gateway.unhealthy".into(),
+                code: "rescue.gateway.unhealthy".into(),
+                severity: "warn".into(),
+                message: "Rescue gateway is not healthy".into(),
+                auto_fixable: false,
+                fix_hint: Some("Inspect rescue gateway logs before using failover".into()),
+                source: "rescue".into(),
+            });
+        }
+    }
+
+    let doctor_report =
+        parse_json_loose(&primary_doctor_output.stdout).or_else(|| parse_json_loose(&primary_doctor_output.stderr));
+    let doctor_issues = doctor_report
+        .as_ref()
+        .map(|report| parse_doctor_issues(report, "primary"))
+        .unwrap_or_default();
+    let doctor_issue_count = doctor_issues.len();
+    let doctor_score = doctor_report
+        .as_ref()
+        .and_then(|report| report.get("score"))
+        .and_then(Value::as_i64);
+    let doctor_ok_from_report = doctor_report
+        .as_ref()
+        .and_then(|report| report.get("ok"))
+        .and_then(Value::as_bool)
+        .unwrap_or(primary_doctor_output.exit_code == 0);
+    let doctor_has_error = doctor_issues.iter().any(|issue| issue.severity == "error");
+    let doctor_check_ok = doctor_ok_from_report && !doctor_has_error;
+
+    let doctor_detail = if let Some(score) = doctor_score {
+        format!("score={score}, issues={doctor_issue_count}")
+    } else {
+        command_detail(primary_doctor_output)
+    };
+    checks.push(RescuePrimaryCheckItem {
+        id: "primary.doctor".into(),
+        title: "Primary doctor report".into(),
+        ok: doctor_check_ok,
+        detail: doctor_detail,
+    });
+
+    if doctor_report.is_none() && primary_doctor_output.exit_code != 0 {
+        issues.push(RescuePrimaryIssue {
+            id: "primary.doctor.failed".into(),
+            code: "primary.doctor.failed".into(),
+            severity: "error".into(),
+            message: "Primary doctor command failed".into(),
+            auto_fixable: false,
+            fix_hint: Some("Review doctor output in this check and open gateway logs for details".into()),
+            source: "primary".into(),
+        });
+    }
+    issues.extend(doctor_issues);
+
+    let primary_gateway_ok = gateway_output_ok(primary_gateway_status);
+    checks.push(RescuePrimaryCheckItem {
+        id: "primary.gateway.status".into(),
+        title: "Primary gateway status".into(),
+        ok: primary_gateway_ok,
+        detail: gateway_output_detail(primary_gateway_status),
+    });
+    if !primary_gateway_ok {
+        issues.push(RescuePrimaryIssue {
+            id: "primary.gateway.unhealthy".into(),
+            code: "primary.gateway.unhealthy".into(),
+            severity: "error".into(),
+            message: "Primary gateway is not healthy".into(),
+            auto_fixable: false,
+            fix_hint: Some("Inspect gateway logs and restart primary gateway".into()),
+            source: "primary".into(),
+        });
+    }
+
+    dedupe_rescue_primary_issues(&mut issues);
+
+    RescuePrimaryDiagnosisResult {
+        status: classify_rescue_primary_status(&issues),
+        checked_at: format_timestamp_from_unix(unix_timestamp_secs()),
+        target_profile: target_profile.to_string(),
+        rescue_profile: rescue_profile.to_string(),
+        rescue_configured,
+        rescue_port,
+        checks,
+        issues,
+    }
+}
+
+fn diagnose_primary_via_rescue_local(
+    target_profile: &str,
+    rescue_profile: &str,
+) -> Result<RescuePrimaryDiagnosisResult, String> {
+    let (rescue_configured, rescue_port) = resolve_local_rescue_profile_state(rescue_profile)?;
+    let rescue_gateway_status = if rescue_configured {
+        let command = build_profile_command(rescue_profile, &["gateway", "status", "--no-probe", "--json"]);
+        Some(run_openclaw_dynamic(&command)?)
+    } else {
+        None
+    };
+    let primary_doctor_output = run_local_primary_doctor_with_fallback(target_profile)?;
+    let primary_gateway_command =
+        build_profile_command(target_profile, &["gateway", "status", "--no-probe", "--json"]);
+    let primary_gateway_output = run_openclaw_dynamic(&primary_gateway_command)?;
+
+    Ok(build_rescue_primary_diagnosis(
+        target_profile,
+        rescue_profile,
+        rescue_configured,
+        rescue_port,
+        rescue_gateway_status.as_ref(),
+        &primary_doctor_output,
+        &primary_gateway_output,
+    ))
+}
+
+async fn diagnose_primary_via_rescue_remote(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    target_profile: &str,
+    rescue_profile: &str,
+) -> Result<RescuePrimaryDiagnosisResult, String> {
+    let (rescue_configured, rescue_port) =
+        resolve_remote_rescue_profile_state(pool, host_id, rescue_profile).await?;
+    let rescue_gateway_status = if rescue_configured {
+        let command = build_profile_command(rescue_profile, &["gateway", "status", "--no-probe", "--json"]);
+        Some(run_remote_openclaw_dynamic(pool, host_id, command).await?)
+    } else {
+        None
+    };
+    let primary_doctor_output =
+        run_remote_primary_doctor_with_fallback(pool, host_id, target_profile).await?;
+    let primary_gateway_command =
+        build_profile_command(target_profile, &["gateway", "status", "--no-probe", "--json"]);
+    let primary_gateway_output = run_remote_openclaw_dynamic(pool, host_id, primary_gateway_command).await?;
+
+    Ok(build_rescue_primary_diagnosis(
+        target_profile,
+        rescue_profile,
+        rescue_configured,
+        rescue_port,
+        rescue_gateway_status.as_ref(),
+        &primary_doctor_output,
+        &primary_gateway_output,
+    ))
+}
+
+fn collect_safe_primary_issue_ids(
+    diagnosis: &RescuePrimaryDiagnosisResult,
+    requested_ids: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut seen_safe = HashSet::new();
+    let safe_ids = diagnosis
+        .issues
+        .iter()
+        .filter(|issue| issue.source == "primary" && issue.auto_fixable)
+        .filter_map(|issue| {
+            if seen_safe.insert(issue.id.clone()) {
+                Some(issue.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if requested_ids.is_empty() {
+        return (safe_ids, Vec::new());
+    }
+
+    let safe_set = safe_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut selected = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen_requested = HashSet::new();
+    for id in requested_ids {
+        if !seen_requested.insert(id.clone()) {
+            continue;
+        }
+        if safe_set.contains(id) {
+            selected.push(id.clone());
+        } else {
+            skipped.push(id.clone());
+        }
+    }
+    (selected, skipped)
+}
+
+fn build_primary_issue_fix_command(
+    target_profile: &str,
+    issue_id: &str,
+) -> Option<(String, Vec<String>)> {
+    let normalize_primary_model_command = || {
+        build_profile_command(
+            target_profile,
+            &[
+                "config",
+                "set",
+                "agents.defaults.model",
+                "anthropic/claude-sonnet-4-5",
+                "--json",
+            ],
+        )
+    };
+
+    match issue_id {
+        "field.agents" => Some((
+            "Initialize agents.defaults.model".into(),
+            normalize_primary_model_command(),
+        )),
+        "json.syntax" => Some((
+            "Normalize primary profile config".into(),
+            // For malformed JSON/JSON5 configs, writing a known-safe key through
+            // `openclaw config set` forces CLI parsing + canonical rewrite.
+            normalize_primary_model_command(),
+        )),
+        "field.port" => Some((
+            "Normalize gateway port".into(),
+            build_profile_command(
+                target_profile,
+                &["config", "set", "gateway.port", "18789", "--json"],
+            ),
+        )),
+        _ => None,
+    }
+}
+
+fn build_step_detail(command: &[String], output: &OpenclawCommandOutput) -> String {
+    if output.exit_code == 0 {
+        return command_detail(output);
+    }
+    command_failure_message(command, output)
+}
+
+fn run_local_profile_restart_with_fallback(
+    profile: &str,
+    steps: &mut Vec<RescuePrimaryRepairStep>,
+) -> Result<bool, String> {
+    let restart_command = build_profile_command(profile, &["gateway", "restart"]);
+    let restart_output = run_openclaw_dynamic(&restart_command)?;
+    let restart_ok = restart_output.exit_code == 0;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.restart".into(),
+        title: "Restart primary gateway".into(),
+        ok: restart_ok,
+        detail: build_step_detail(&restart_command, &restart_output),
+        command: Some(restart_command.clone()),
+    });
+    if restart_ok {
+        return Ok(true);
+    }
+
+    if !is_gateway_restart_timeout(&restart_output) {
+        return Ok(false);
+    }
+
+    let stop_command = build_profile_command(profile, &["gateway", "stop"]);
+    let stop_output = run_openclaw_dynamic(&stop_command)?;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.stop".into(),
+        title: "Stop primary gateway (restart fallback)".into(),
+        ok: stop_output.exit_code == 0,
+        detail: build_step_detail(&stop_command, &stop_output),
+        command: Some(stop_command),
+    });
+
+    let start_command = build_profile_command(profile, &["gateway", "start"]);
+    let start_output = run_openclaw_dynamic(&start_command)?;
+    let start_ok = start_output.exit_code == 0;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.start".into(),
+        title: "Start primary gateway (restart fallback)".into(),
+        ok: start_ok,
+        detail: build_step_detail(&start_command, &start_output),
+        command: Some(start_command),
+    });
+    Ok(start_ok)
+}
+
+async fn run_remote_profile_restart_with_fallback(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &str,
+    steps: &mut Vec<RescuePrimaryRepairStep>,
+) -> Result<bool, String> {
+    let restart_command = build_profile_command(profile, &["gateway", "restart"]);
+    let restart_output = run_remote_openclaw_dynamic(pool, host_id, restart_command.clone()).await?;
+    let restart_ok = restart_output.exit_code == 0;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.restart".into(),
+        title: "Restart primary gateway".into(),
+        ok: restart_ok,
+        detail: build_step_detail(&restart_command, &restart_output),
+        command: Some(restart_command.clone()),
+    });
+    if restart_ok {
+        return Ok(true);
+    }
+
+    if !is_gateway_restart_timeout(&restart_output) {
+        return Ok(false);
+    }
+
+    let stop_command = build_profile_command(profile, &["gateway", "stop"]);
+    let stop_output = run_remote_openclaw_dynamic(pool, host_id, stop_command.clone()).await?;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.stop".into(),
+        title: "Stop primary gateway (restart fallback)".into(),
+        ok: stop_output.exit_code == 0,
+        detail: build_step_detail(&stop_command, &stop_output),
+        command: Some(stop_command),
+    });
+
+    let start_command = build_profile_command(profile, &["gateway", "start"]);
+    let start_output = run_remote_openclaw_dynamic(pool, host_id, start_command.clone()).await?;
+    let start_ok = start_output.exit_code == 0;
+    steps.push(RescuePrimaryRepairStep {
+        id: "primary.gateway.start".into(),
+        title: "Start primary gateway (restart fallback)".into(),
+        ok: start_ok,
+        detail: build_step_detail(&start_command, &start_output),
+        command: Some(start_command),
+    });
+    Ok(start_ok)
+}
+
+fn repair_primary_via_rescue_local(
+    target_profile: &str,
+    rescue_profile: &str,
+    issue_ids: Vec<String>,
+) -> Result<RescuePrimaryRepairResult, String> {
+    let attempted_at = format_timestamp_from_unix(unix_timestamp_secs());
+    let before = diagnose_primary_via_rescue_local(target_profile, rescue_profile)?;
+    let (selected_issue_ids, mut skipped_issue_ids) = collect_safe_primary_issue_ids(&before, &issue_ids);
+    let mut applied_issue_ids = Vec::new();
+    let mut failed_issue_ids = Vec::new();
+    let mut steps = Vec::new();
+
+    if !before.rescue_configured {
+        steps.push(RescuePrimaryRepairStep {
+            id: "precheck.rescue_configured".into(),
+            title: "Rescue profile availability".into(),
+            ok: false,
+            detail: format!(
+                "Rescue profile \"{}\" is not configured; activate it before repair",
+                before.rescue_profile
+            ),
+            command: None,
+        });
+        let after = before.clone();
+        return Ok(RescuePrimaryRepairResult {
+            attempted_at,
+            target_profile: target_profile.to_string(),
+            rescue_profile: rescue_profile.to_string(),
+            selected_issue_ids,
+            applied_issue_ids,
+            skipped_issue_ids,
+            failed_issue_ids,
+            steps,
+            before,
+            after,
+        });
+    }
+
+    if selected_issue_ids.is_empty() {
+        steps.push(RescuePrimaryRepairStep {
+            id: "repair.noop".into(),
+            title: "No safe auto-fixes available".into(),
+            ok: true,
+            detail: "No auto-fixable primary issues were selected".into(),
+            command: None,
+        });
+    } else {
+        for issue_id in &selected_issue_ids {
+            let Some((title, command)) = build_primary_issue_fix_command(target_profile, issue_id) else {
+                skipped_issue_ids.push(issue_id.clone());
+                steps.push(RescuePrimaryRepairStep {
+                    id: format!("repair.{issue_id}"),
+                    title: "Skip unsupported issue fix".into(),
+                    ok: false,
+                    detail: format!("No safe repair mapping for issue \"{issue_id}\""),
+                    command: None,
+                });
+                continue;
+            };
+            let output = run_openclaw_dynamic(&command)?;
+            let ok = output.exit_code == 0;
+            steps.push(RescuePrimaryRepairStep {
+                id: format!("repair.{issue_id}"),
+                title,
+                ok,
+                detail: build_step_detail(&command, &output),
+                command: Some(command),
+            });
+            if ok {
+                applied_issue_ids.push(issue_id.clone());
+            } else {
+                failed_issue_ids.push(issue_id.clone());
+            }
+        }
+    }
+
+    if !applied_issue_ids.is_empty() {
+        let restart_ok = run_local_profile_restart_with_fallback(target_profile, &mut steps)?;
+        if !restart_ok {
+            failed_issue_ids.push("primary.gateway.restart".into());
+        }
+    }
+
+    let after = diagnose_primary_via_rescue_local(target_profile, rescue_profile)?;
+    Ok(RescuePrimaryRepairResult {
+        attempted_at,
+        target_profile: target_profile.to_string(),
+        rescue_profile: rescue_profile.to_string(),
+        selected_issue_ids,
+        applied_issue_ids,
+        skipped_issue_ids,
+        failed_issue_ids,
+        steps,
+        before,
+        after,
     })
 }
+
+async fn repair_primary_via_rescue_remote(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    target_profile: &str,
+    rescue_profile: &str,
+    issue_ids: Vec<String>,
+) -> Result<RescuePrimaryRepairResult, String> {
+    let attempted_at = format_timestamp_from_unix(unix_timestamp_secs());
+    let before = diagnose_primary_via_rescue_remote(pool, host_id, target_profile, rescue_profile).await?;
+    let (selected_issue_ids, mut skipped_issue_ids) = collect_safe_primary_issue_ids(&before, &issue_ids);
+    let mut applied_issue_ids = Vec::new();
+    let mut failed_issue_ids = Vec::new();
+    let mut steps = Vec::new();
+
+    if !before.rescue_configured {
+        steps.push(RescuePrimaryRepairStep {
+            id: "precheck.rescue_configured".into(),
+            title: "Rescue profile availability".into(),
+            ok: false,
+            detail: format!(
+                "Rescue profile \"{}\" is not configured; activate it before repair",
+                before.rescue_profile
+            ),
+            command: None,
+        });
+        let after = before.clone();
+        return Ok(RescuePrimaryRepairResult {
+            attempted_at,
+            target_profile: target_profile.to_string(),
+            rescue_profile: rescue_profile.to_string(),
+            selected_issue_ids,
+            applied_issue_ids,
+            skipped_issue_ids,
+            failed_issue_ids,
+            steps,
+            before,
+            after,
+        });
+    }
+
+    if selected_issue_ids.is_empty() {
+        steps.push(RescuePrimaryRepairStep {
+            id: "repair.noop".into(),
+            title: "No safe auto-fixes available".into(),
+            ok: true,
+            detail: "No auto-fixable primary issues were selected".into(),
+            command: None,
+        });
+    } else {
+        for issue_id in &selected_issue_ids {
+            let Some((title, command)) = build_primary_issue_fix_command(target_profile, issue_id) else {
+                skipped_issue_ids.push(issue_id.clone());
+                steps.push(RescuePrimaryRepairStep {
+                    id: format!("repair.{issue_id}"),
+                    title: "Skip unsupported issue fix".into(),
+                    ok: false,
+                    detail: format!("No safe repair mapping for issue \"{issue_id}\""),
+                    command: None,
+                });
+                continue;
+            };
+            let output = run_remote_openclaw_dynamic(pool, host_id, command.clone()).await?;
+            let ok = output.exit_code == 0;
+            steps.push(RescuePrimaryRepairStep {
+                id: format!("repair.{issue_id}"),
+                title,
+                ok,
+                detail: build_step_detail(&command, &output),
+                command: Some(command),
+            });
+            if ok {
+                applied_issue_ids.push(issue_id.clone());
+            } else {
+                failed_issue_ids.push(issue_id.clone());
+            }
+        }
+    }
+
+    if !applied_issue_ids.is_empty() {
+        let restart_ok =
+            run_remote_profile_restart_with_fallback(pool, host_id, target_profile, &mut steps).await?;
+        if !restart_ok {
+            failed_issue_ids.push("primary.gateway.restart".into());
+        }
+    }
+
+    let after = diagnose_primary_via_rescue_remote(pool, host_id, target_profile, rescue_profile).await?;
+    Ok(RescuePrimaryRepairResult {
+        attempted_at,
+        target_profile: target_profile.to_string(),
+        rescue_profile: rescue_profile.to_string(),
+        selected_issue_ids,
+        applied_issue_ids,
+        skipped_issue_ids,
+        failed_issue_ids,
+        steps,
+        before,
+        after,
+    })
+}
+
+fn resolve_gateway_port_from_config(cfg: &Value) -> u16 {
+    cfg.pointer("/gateway/port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or(18789)
+}
+
+fn suggest_rescue_port(main_port: u16) -> u16 {
+    // Keep trailing digits stable (18789 -> 19789) while preserving at least +20 gap.
+    let with_large_gap = main_port.saturating_add(1000);
+    let min_gap = main_port.saturating_add(20);
+    with_large_gap.max(min_gap)
+}
+
+fn ensure_rescue_port_spacing(main_port: u16, rescue_port: u16) -> Result<(), String> {
+    let min_recommended_port = main_port.saturating_add(20);
+    if rescue_port < min_recommended_port {
+        return Err(format!(
+            "rescue port {rescue_port} is too close to primary gateway port {main_port}; \
+             choose at least {min_recommended_port} (>= +20)"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_rescue_port_value(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(n) => n.as_u64().and_then(|v| u16::try_from(v).ok()),
+        Value::String(s) => s.trim().parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+fn resolve_local_rescue_profile_state(profile: &str) -> Result<(bool, Option<u16>), String> {
+    let output = crate::cli_runner::run_openclaw(&[
+        "--profile",
+        profile,
+        "config",
+        "get",
+        "gateway.port",
+        "--json",
+    ])?;
+    if output.exit_code != 0 {
+        return Ok((false, None));
+    }
+    let port = crate::cli_runner::parse_json_output(&output)
+        .ok()
+        .and_then(|value| parse_rescue_port_value(&value));
+    Ok((true, port))
+}
+
+fn build_rescue_bot_command_plan(
+    action: RescueBotAction,
+    profile: &str,
+    rescue_port: u16,
+    include_configure: bool,
+) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let profile_arg = vec!["--profile".to_string(), profile.to_string()];
+    let rescue_port_str = rescue_port.to_string();
+
+    match action {
+        RescueBotAction::Set => {
+            if include_configure {
+                commands.push({
+                    let mut cmd = profile_arg.clone();
+                    cmd.push("setup".into());
+                    cmd
+                });
+                commands.push({
+                    let mut cmd = profile_arg.clone();
+                    cmd.extend([
+                        "config".into(),
+                        "set".into(),
+                        "gateway.port".into(),
+                        rescue_port_str,
+                        "--json".into(),
+                    ]);
+                    cmd
+                });
+            }
+        }
+        RescueBotAction::Activate => {
+            commands.extend(build_rescue_bot_command_plan(
+                RescueBotAction::Set,
+                profile,
+                rescue_port,
+                include_configure,
+            ));
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend(["gateway".into(), "install".into()]);
+                cmd
+            });
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend(["gateway".into(), "restart".into()]);
+                cmd
+            });
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend([
+                    "gateway".into(),
+                    "status".into(),
+                    "--no-probe".into(),
+                    "--json".into(),
+                ]);
+                cmd
+            });
+        }
+        RescueBotAction::Status => {
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend([
+                    "gateway".into(),
+                    "status".into(),
+                    "--no-probe".into(),
+                    "--json".into(),
+                ]);
+                cmd
+            });
+        }
+        RescueBotAction::Deactivate => {
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend(["gateway".into(), "stop".into()]);
+                cmd
+            });
+            commands.push({
+                let mut cmd = profile_arg;
+                cmd.extend([
+                    "gateway".into(),
+                    "status".into(),
+                    "--no-probe".into(),
+                    "--json".into(),
+                ]);
+                cmd
+            });
+        }
+        RescueBotAction::Unset => {
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend(["gateway".into(), "stop".into()]);
+                cmd
+            });
+            commands.push({
+                let mut cmd = profile_arg.clone();
+                cmd.extend(["gateway".into(), "uninstall".into()]);
+                cmd
+            });
+            commands.push({
+                let mut cmd = profile_arg;
+                cmd.extend([
+                    "config".into(),
+                    "unset".into(),
+                    "gateway.port".into(),
+                ]);
+                cmd
+            });
+        }
+    }
+
+    commands
+}
+
+fn command_failure_message(command: &[String], output: &OpenclawCommandOutput) -> String {
+    let details = if !output.stderr.trim().is_empty() {
+        output.stderr.trim()
+    } else if !output.stdout.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        "no output"
+    };
+    format!(
+        "openclaw {} failed (exit {}): {}",
+        command.join(" "),
+        output.exit_code,
+        details
+    )
+}
+
+fn is_gateway_restart_command(command: &[String]) -> bool {
+    command.len() >= 2
+        && command[command.len() - 2] == "gateway"
+        && command[command.len() - 1] == "restart"
+}
+
+fn is_gateway_stop_command(command: &[String]) -> bool {
+    command.len() >= 2
+        && command[command.len() - 2] == "gateway"
+        && command[command.len() - 1] == "stop"
+}
+
+fn is_gateway_uninstall_command(command: &[String]) -> bool {
+    command.len() >= 2
+        && command[command.len() - 2] == "gateway"
+        && command[command.len() - 1] == "uninstall"
+}
+
+fn is_gateway_status_command(command: &[String]) -> bool {
+    command.windows(2).any(|window| window[0] == "gateway" && window[1] == "status")
+}
+
+fn is_config_unset_gateway_port_command(command: &[String]) -> bool {
+    command
+        .windows(3)
+        .any(|window| window[0] == "config" && window[1] == "unset" && window[2] == "gateway.port")
+}
+
+fn is_gateway_restart_timeout(output: &OpenclawCommandOutput) -> bool {
+    let details = format!("{}\n{}", output.stderr, output.stdout).to_ascii_lowercase();
+    details.contains("gateway restart timed out")
+        || (details.contains("timed out") && details.contains("health check"))
+}
+
+fn is_doctor_json_option_unsupported(output: &OpenclawCommandOutput) -> bool {
+    let details = format!("{}\n{}", output.stderr, output.stdout).to_ascii_lowercase();
+    (details.contains("unknown option")
+        || details.contains("unknown argument")
+        || details.contains("unrecognized option")
+        || details.contains("unexpected argument")
+        || details.contains("no such option"))
+        && details.contains("--json")
+}
+
+fn is_rescue_cleanup_noop(
+    action: RescueBotAction,
+    command: &[String],
+    output: &OpenclawCommandOutput,
+) -> bool {
+    if output.exit_code == 0 || !matches!(action, RescueBotAction::Deactivate | RescueBotAction::Unset) {
+        return false;
+    }
+    let details = format!("{}\n{}", output.stderr, output.stdout).to_ascii_lowercase();
+    if details.contains("profile") && details.contains("not found") {
+        return true;
+    }
+    if is_gateway_stop_command(command) {
+        return details.contains("not running")
+            || details.contains("already stopped")
+            || details.contains("isn't running")
+            || details.contains("is not running");
+    }
+    if is_gateway_uninstall_command(command) {
+        return details.contains("not installed")
+            || details.contains("already uninstalled")
+            || details.contains("isn't installed")
+            || details.contains("is not installed");
+    }
+    if is_config_unset_gateway_port_command(command) {
+        return details.contains("not found")
+            || details.contains("not set")
+            || details.contains("does not exist")
+            || details.contains("missing");
+    }
+    if is_gateway_status_command(command) {
+        return details.contains("not running")
+            || details.contains("not installed")
+            || details.contains("not found")
+            || details.contains("is not running")
+            || details.contains("isn't running");
+    }
+    false
+}
+
+fn run_local_rescue_bot_command(command: Vec<String>) -> Result<RescueBotCommandResult, String> {
+    let output = run_openclaw_dynamic(&command)?;
+    Ok(RescueBotCommandResult { command, output })
+}
+
+fn run_local_primary_doctor_with_fallback(profile: &str) -> Result<OpenclawCommandOutput, String> {
+    let json_command = build_profile_command(profile, &["doctor", "--json"]);
+    let output = run_openclaw_dynamic(&json_command)?;
+    if output.exit_code != 0 && is_doctor_json_option_unsupported(&output) {
+        let plain_command = build_profile_command(profile, &["doctor"]);
+        return run_openclaw_dynamic(&plain_command);
+    }
+    Ok(output)
+}
+
+fn run_local_gateway_restart_fallback(
+    profile: &str,
+    commands: &mut Vec<RescueBotCommandResult>,
+) -> Result<(), String> {
+    let stop_command = vec![
+        "--profile".to_string(),
+        profile.to_string(),
+        "gateway".to_string(),
+        "stop".to_string(),
+    ];
+    let stop_result = run_local_rescue_bot_command(stop_command)?;
+    commands.push(stop_result);
+
+    let start_command = vec![
+        "--profile".to_string(),
+        profile.to_string(),
+        "gateway".to_string(),
+        "start".to_string(),
+    ];
+    let start_result = run_local_rescue_bot_command(start_command)?;
+    if start_result.output.exit_code != 0 {
+        return Err(command_failure_message(
+            &start_result.command,
+            &start_result.output,
+        ));
+    }
+    commands.push(start_result);
+    Ok(())
+}
+
+fn run_openclaw_dynamic(args: &[String]) -> Result<OpenclawCommandOutput, String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::cli_runner::run_openclaw(&refs).map(Into::into)
+}
+
+async fn resolve_remote_rescue_profile_state(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &str,
+) -> Result<(bool, Option<u16>), String> {
+    let output = crate::cli_runner::run_openclaw_remote(
+        pool,
+        host_id,
+        &[
+            "--profile",
+            profile,
+            "config",
+            "get",
+            "gateway.port",
+            "--json",
+        ],
+    )
+    .await?;
+    if output.exit_code != 0 {
+        return Ok((false, None));
+    }
+    let port = crate::cli_runner::parse_json_output(&output)
+        .ok()
+        .and_then(|value| parse_rescue_port_value(&value));
+    Ok((true, port))
+}
+
 
 fn run_openclaw_raw(args: &[&str]) -> Result<OpenclawCommandOutput, String> {
     run_openclaw_raw_timeout(args, None)
 }
 
 fn run_openclaw_raw_timeout(args: &[&str], timeout_secs: Option<u64>) -> Result<OpenclawCommandOutput, String> {
-    let mut child = Command::new("openclaw")
+    let mut child = Command::new(resolve_openclaw_bin())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1952,8 +3451,30 @@ fn run_openclaw_raw_timeout(args: &[&str], timeout_secs: Option<u64>) -> Result<
 
 /// Strip leading non-JSON lines from CLI output (plugin logs, ANSI codes, etc.)
 fn extract_json_from_output(raw: &str) -> Option<&str> {
-    let start = raw.find('{').or_else(|| raw.find('['))?;
-    Some(&raw[start..])
+    let end_object = raw.rfind('}');
+    let end_array = raw.rfind(']');
+    let (end, opener, closer) = match (end_object, end_array) {
+        (Some(object_end), Some(array_end)) if object_end > array_end => (object_end, b'{', b'}'),
+        (Some(_), Some(array_end)) => (array_end, b'[', b']'),
+        (Some(object_end), None) => (object_end, b'{', b'}'),
+        (None, Some(array_end)) => (array_end, b'[', b']'),
+        (None, None) => return None,
+    };
+
+    let bytes = raw.as_bytes();
+    let mut depth: i32 = 0;
+    for i in (0..=end).rev() {
+        let ch = bytes[i];
+        if ch == closer {
+            depth += 1;
+        } else if ch == opener {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&raw[i..=end]);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the last JSON array from CLI output that may contain ANSI codes and plugin logs.
@@ -1998,6 +3519,92 @@ fn parse_resolve_name_map(stdout: &str) -> Option<HashMap<String, String>> {
         }
     }
     Some(map)
+}
+
+/// Parse `openclaw directory groups list --json` output into channel ids.
+fn parse_directory_group_channel_ids(stdout: &str) -> Vec<String> {
+    let json_str = match extract_last_json_array(stdout) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let parsed: Vec<Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut ids = Vec::new();
+    for item in parsed {
+        let raw = item.get("id").and_then(Value::as_str).unwrap_or("");
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed
+            .strip_prefix("channel:")
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string();
+        if normalized.is_empty() || ids.contains(&normalized) {
+            continue;
+        }
+        ids.push(normalized);
+    }
+    ids
+}
+
+fn collect_discord_config_guild_ids(discord_cfg: Option<&Value>) -> Vec<String> {
+    let mut guild_ids = Vec::new();
+    if let Some(guilds) = discord_cfg
+        .and_then(|d| d.get("guilds"))
+        .and_then(Value::as_object)
+    {
+        for guild_id in guilds.keys() {
+            if !guild_ids.contains(guild_id) {
+                guild_ids.push(guild_id.clone());
+            }
+        }
+    }
+    if let Some(accounts) = discord_cfg
+        .and_then(|d| d.get("accounts"))
+        .and_then(Value::as_object)
+    {
+        for account in accounts.values() {
+            if let Some(guilds) = account.get("guilds").and_then(Value::as_object) {
+                for guild_id in guilds.keys() {
+                    if !guild_ids.contains(guild_id) {
+                        guild_ids.push(guild_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    guild_ids
+}
+
+#[cfg(test)]
+mod discord_directory_parse_tests {
+    use super::parse_directory_group_channel_ids;
+
+    #[test]
+    fn parse_directory_groups_extracts_channel_ids() {
+        let stdout = r#"
+[plugins] example
+[
+  {"kind":"group","id":"channel:123"},
+  {"kind":"group","id":"channel:456"},
+  {"kind":"group","id":"channel:123"},
+  {"kind":"group","id":"  channel:789  "}
+]
+"#;
+        let ids = parse_directory_group_channel_ids(stdout);
+        assert_eq!(ids, vec!["123", "456", "789"]);
+    }
+
+    #[test]
+    fn parse_directory_groups_handles_missing_json() {
+        let stdout = "not json";
+        let ids = parse_directory_group_channel_ids(stdout);
+        assert!(ids.is_empty());
+    }
 }
 
 fn extract_version_from_text(input: &str) -> Option<String> {
@@ -2094,15 +3701,36 @@ fn model_catalog_cache_path(paths: &crate::models::OpenClawPaths) -> PathBuf {
     paths.clawpal_dir.join("model-catalog-cache.json")
 }
 
+fn remote_model_catalog_cache_path(paths: &crate::models::OpenClawPaths, host_id: &str) -> PathBuf {
+    let safe_host_id: String = host_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    paths
+        .clawpal_dir
+        .join("remote-model-catalog")
+        .join(format!("{safe_host_id}.json"))
+}
+
 fn normalize_model_ref(raw: &str) -> String {
     raw.trim().to_lowercase().replace('\\', "/")
 }
 
 fn resolve_openclaw_version() -> String {
-    match run_openclaw_raw(&["--version"]) {
-        Ok(output) => extract_version_from_text(&output.stdout).unwrap_or_else(|| "unknown".into()),
-        Err(_) => "unknown".into(),
-    }
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        match run_openclaw_raw(&["--version"]) {
+            Ok(output) => extract_version_from_text(&output.stdout).unwrap_or_else(|| "unknown".into()),
+            Err(_) => "unknown".into(),
+        }
+    }).clone()
 }
 
 fn check_openclaw_update_cached(paths: &crate::models::OpenClawPaths, force: bool) -> Result<OpenclawUpdateCheck, String> {
@@ -2265,7 +3893,10 @@ fn query_openclaw_latest_npm() -> Result<Option<String>, String> {
 /// Fetch a Discord guild name via the Discord REST API using a bot token.
 fn fetch_discord_guild_name(bot_token: &str, guild_id: &str) -> Result<String, String> {
     let url = format!("https://discord.com/api/v10/guilds/{guild_id}");
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("Discord HTTP client error: {e}"))?;
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bot {bot_token}"))
@@ -2279,6 +3910,44 @@ fn fetch_discord_guild_name(bot_token: &str, guild_id: &str) -> Result<String, S
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .ok_or_else(|| "No name field in Discord guild response".to_string())
+}
+
+/// Fetch Discord channels for a guild via REST API using a bot token.
+fn fetch_discord_guild_channels(bot_token: &str, guild_id: &str) -> Result<Vec<(String, String)>, String> {
+    let url = format!("https://discord.com/api/v10/guilds/{guild_id}/channels");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|e| format!("Discord HTTP client error: {e}"))?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .send()
+        .map_err(|e| format!("Discord API request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Discord API returned status {}", resp.status()));
+    }
+    let body: Value = resp.json().map_err(|e| format!("Failed to parse Discord response: {e}"))?;
+    let arr = body.as_array().ok_or_else(|| "Discord response is not an array".to_string())?;
+    let mut out = Vec::new();
+    for item in arr {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let (Some(id), Some(name)) = (id, name) {
+            if !out.iter().any(|(existing_id, _)| *existing_id == id) {
+                out.push((id, name));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn collect_channel_summary(cfg: &Value) -> ChannelSummary {
@@ -2502,46 +4171,6 @@ fn collect_file_inventory_with_limit(path: &Path) -> InventorySummary {
     }
 }
 
-fn list_memory_files_detailed(memory_root: &Path) -> Result<Vec<MemoryFile>, String> {
-    if !memory_root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut queue = VecDeque::new();
-    let mut files = Vec::new();
-    queue.push_back(memory_root.to_path_buf());
-    while let Some(current) = queue.pop_front() {
-        let entries = match fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let metadata = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            if metadata.is_dir() {
-                queue.push_back(entry_path);
-                continue;
-            }
-            if metadata.is_file() {
-                let relative_path = entry_path
-                    .strip_prefix(memory_root)
-                    .unwrap_or(&entry_path)
-                    .to_string_lossy()
-                    .to_string();
-                files.push(MemoryFile {
-                    path: entry_path.to_string_lossy().to_string(),
-                    relative_path,
-                    size_bytes: metadata.len(),
-                });
-            }
-        }
-    }
-    files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    Ok(files)
-}
-
 fn list_session_files_detailed(base_dir: &Path) -> Result<Vec<SessionFile>, String> {
     let agents_root = base_dir.join("agents");
     if !agents_root.exists() {
@@ -2611,53 +4240,6 @@ fn collect_session_files_in_scope(
     Ok(())
 }
 
-fn resolve_child_path(root: &Path, target: &str) -> Result<PathBuf, String> {
-    if target.trim().is_empty() {
-        return Err("path is required".into());
-    }
-    let candidate = if Path::new(target).is_absolute() {
-        PathBuf::from(target)
-    } else {
-        root.join(target)
-    };
-    let root_abs = if root.exists() {
-        fs::canonicalize(root).map_err(|e| e.to_string())?
-    } else {
-        return Err("root directory not found".into());
-    };
-    let target_abs = fs::canonicalize(&candidate).map_err(|e| e.to_string())?;
-    if !target_abs.starts_with(&root_abs) {
-        return Err("path is outside managed directory".into());
-    }
-    Ok(target_abs)
-}
-
-fn count_files_recursive(root: &Path) -> usize {
-    if !root.exists() {
-        return 0;
-    }
-    let mut queue = VecDeque::new();
-    let mut total = 0usize;
-    queue.push_back(root.to_path_buf());
-    while let Some(current) = queue.pop_front() {
-        let entries = match fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                let entry_path = entry.path();
-                if metadata.is_dir() {
-                    queue.push_back(entry_path);
-                } else if metadata.is_file() {
-                    total = total.saturating_add(1);
-                }
-            }
-        }
-    }
-    total
-}
-
 fn clear_agent_and_global_sessions(agents_root: &Path, agent_id: Option<&str>) -> Result<usize, String> {
     if !agents_root.exists() {
         return Ok(0);
@@ -2721,36 +4303,22 @@ fn model_profiles_path(paths: &crate::models::OpenClawPaths) -> std::path::PathB
     paths.clawpal_dir.join("model-profiles.json")
 }
 
-fn resolve_profile_model_value(
-    paths: &crate::models::OpenClawPaths,
-    profile_id: Option<String>,
-) -> Result<Option<String>, String> {
-    let profile_id = profile_id.and_then(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    if profile_id.is_none() {
-        return Ok(None);
-    }
-    let target = profile_id.expect("checked");
-    let profiles = load_model_profiles(paths);
-    for profile in profiles {
-        if profile.id == target {
-            return Ok(Some(profile_to_model_value(&profile)));
-        }
-    }
-    Err(format!("model profile not found: {target}"))
-}
+
 
 fn profile_to_model_value(profile: &ModelProfile) -> String {
-    if profile.model.contains('/') {
-        profile.model.clone()
+    let provider = profile.provider.trim();
+    let model = profile.model.trim();
+    if provider.is_empty() {
+        return model.to_string();
+    }
+    if model.is_empty() {
+        return format!("{provider}/");
+    }
+    let normalized_prefix = format!("{}/", provider.to_lowercase());
+    if model.to_lowercase().starts_with(&normalized_prefix) {
+        model.to_string()
     } else {
-        format!("{}/{}", profile.provider, profile.model)
+        format!("{provider}/{model}")
     }
 }
 
@@ -2775,6 +4343,158 @@ pub fn resolve_api_keys() -> Result<Vec<ResolvedApiKey>, String> {
         });
     }
     Ok(out)
+}
+
+fn truncate_error_text(input: &str, max_chars: usize) -> String {
+    if let Some((i, _)) = input.char_indices().nth(max_chars) {
+        format!("{}...", &input[..i])
+    } else {
+        input.to_string()
+    }
+}
+
+const MAX_ERROR_SNIPPET_CHARS: usize = 280;
+
+fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("https://api.openai.com/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "xai" | "grok" => Some("https://api.x.ai/v1"),
+        "together" => Some("https://api.together.xyz/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        _ => None,
+    }
+}
+
+fn run_provider_probe(
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+    api_key: String,
+) -> Result<(), String> {
+    let provider_trimmed = provider.trim().to_string();
+    let mut model_trimmed = model.trim().to_string();
+    if provider_trimmed.is_empty() || model_trimmed.is_empty() {
+        return Err("provider and model are required".into());
+    }
+    let provider_prefix = format!("{}/", provider_trimmed.to_ascii_lowercase());
+    if model_trimmed
+        .to_ascii_lowercase()
+        .starts_with(&provider_prefix)
+    {
+        model_trimmed = model_trimmed[provider_prefix.len()..].to_string();
+        if model_trimmed.trim().is_empty() {
+            return Err("model is empty after provider prefix normalization".into());
+        }
+    }
+    if api_key.trim().is_empty() {
+        return Err("API key is not configured for this profile".into());
+    }
+
+    let resolved_base = base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.trim_end_matches('/').to_string())
+        .or_else(|| default_base_url_for_provider(&provider_trimmed).map(str::to_string))
+        .ok_or_else(|| format!("No base URL configured for provider '{}'", provider_trimmed))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    let lower = provider_trimmed.to_ascii_lowercase();
+    let response = if lower == "anthropic" {
+        let url = format!("{}/messages", resolved_base);
+        client
+            .post(&url)
+            .header("x-api-key", api_key.trim())
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": model_trimmed,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .map_err(|e| format!("Provider request failed: {e}"))?
+    } else {
+        let url = format!("{}/chat/completions", resolved_base);
+        let mut req = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key.trim()))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": model_trimmed,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1
+            }));
+        if lower == "openrouter" {
+            req = req
+                .header("HTTP-Referer", "https://clawpal.zhixian.io")
+                .header("X-Title", "ClawPal");
+        }
+        req.send()
+            .map_err(|e| format!("Provider request failed: {e}"))?
+    };
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .unwrap_or_else(|e| format!("(could not read response body: {e})"));
+    let snippet = truncate_error_text(body.trim(), MAX_ERROR_SNIPPET_CHARS);
+    if snippet.is_empty() {
+        Err(format!("Provider rejected credentials (HTTP {status})"))
+    } else {
+        Err(format!("Provider rejected credentials (HTTP {status}): {snippet}"))
+    }
+}
+
+#[tauri::command]
+pub async fn test_model_profile(profile_id: String) -> Result<bool, String> {
+    let paths = resolve_paths();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile = load_model_profiles(&paths)
+            .into_iter()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| format!("Profile not found: {profile_id}"))?;
+
+        if !profile.enabled {
+            return Err("Profile is disabled".into());
+        }
+
+        let api_key = resolve_profile_api_key(&profile, &paths.base_dir);
+        if api_key.trim().is_empty() {
+            return Err("No API key resolved for this profile".into());
+        }
+
+        let resolved_base_url = profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                fs::read_to_string(&paths.config_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|cfg| resolve_model_provider_base_url(&cfg, &profile.provider))
+            });
+
+        run_provider_probe(profile.provider, profile.model, resolved_base_url, api_key)
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {e}"))??;
+
+    Ok(true)
 }
 
 fn resolve_profile_api_key(profile: &ModelProfile, base_dir: &Path) -> String {
@@ -2903,7 +4623,13 @@ fn save_model_profiles(paths: &crate::models::OpenClawPaths, profiles: &[ModelPr
         version: 1,
     };
     let text = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
-    crate::config_io::write_text(&path, &text)
+    crate::config_io::write_text(&path, &text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn write_config_with_snapshot(
@@ -2991,56 +4717,41 @@ fn set_agent_model_value(
 
 fn load_model_catalog(
     paths: &crate::models::OpenClawPaths,
-    cfg: &Value,
 ) -> Result<Vec<ModelCatalogProvider>, String> {
-    let now = unix_timestamp_secs();
     let cache_path = model_catalog_cache_path(paths);
     let current_version = resolve_openclaw_version();
-    let ttl_seconds = 60 * 60 * 12;
-    if let Some(cached) = read_model_catalog_cache(&cache_path)
-        .filter(|cache| cache.cli_version == current_version)
-    {
-        if now.saturating_sub(cached.updated_at) < ttl_seconds && cached.error.is_none() {
-            return Ok(cached.providers);
-        }
-        if cached.error.is_none() {
-            if let Some(fresh) = extract_model_catalog_from_cli(paths) {
-                if !fresh.is_empty() {
-                    return Ok(fresh);
-                }
-            }
-            if !cached.providers.is_empty() {
-                return Ok(cached.providers);
-            }
-        }
+    let cached = read_model_catalog_cache(&cache_path);
+    if let Some(selected) = select_catalog_from_cache(cached.as_ref(), &current_version) {
+        return Ok(selected);
     }
 
     if let Some(catalog) = extract_model_catalog_from_cli(paths) {
         if !catalog.is_empty() {
-            let cache = ModelCatalogProviderCache {
-                cli_version: current_version,
-                updated_at: now,
-                providers: catalog.clone(),
-                source: "openclaw models list --all --json".into(),
-                error: None,
-            };
-            let _ = save_model_catalog_cache(&cache_path, &cache);
             return Ok(catalog);
         }
     }
 
-    let fallback = collect_model_catalog(cfg);
-    if let Some(cached) = read_model_catalog_cache(&cache_path) {
-        if !cached.providers.is_empty() {
-            let catalog = if fallback.is_empty() {
-                cached.providers
-            } else {
-                fallback
-            };
-            return Ok(catalog);
+    if let Some(previous) = cached {
+        if !previous.providers.is_empty() && previous.error.is_none() {
+            return Ok(previous.providers);
         }
     }
-    Ok(fallback)
+
+    Err("Failed to load model catalog from openclaw CLI".into())
+}
+
+fn select_catalog_from_cache(
+    cached: Option<&ModelCatalogProviderCache>,
+    current_version: &str,
+) -> Option<Vec<ModelCatalogProvider>> {
+    let cache = cached?;
+    if cache.cli_version != current_version {
+        return None;
+    }
+    if cache.error.is_some() || cache.providers.is_empty() {
+        return None;
+    }
+    Some(cache.providers.clone())
 }
 
 /// Parse CLI output from `openclaw models list --all --json` into grouped providers.
@@ -3179,86 +4890,399 @@ fn cache_model_catalog(paths: &crate::models::OpenClawPaths, providers: Vec<Mode
     Some(())
 }
 
-fn collect_model_catalog(cfg: &Value) -> Vec<ModelCatalogProvider> {
-    let mut providers: BTreeMap<String, ModelCatalogProvider> = BTreeMap::new();
+#[cfg(test)]
+mod model_catalog_cache_tests {
+    use super::*;
 
-    if let Some(configured) = cfg.pointer("/models/providers").and_then(Value::as_object) {
-        for (provider_name, provider_cfg) in configured {
-            let provider_model_map = extract_catalog_models(provider_cfg).unwrap_or_default();
-            let base_url = provider_cfg
-                .get("baseUrl")
-                .or_else(|| provider_cfg.get("base_url"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-
-            providers.entry(provider_name.clone())
-                .and_modify(|entry| {
-                    if entry.base_url.is_none() {
-                        entry.base_url = base_url.clone();
-                    }
-                    for model in provider_model_map.iter() {
-                        if !entry.models.iter().any(|item| item.id == model.id) {
-                            entry.models.push(model.clone());
-                        }
-                    }
-                })
-                .or_insert(ModelCatalogProvider {
-                    provider: provider_name.clone(),
-                    base_url,
-                    models: provider_model_map,
-                });
-        }
+    #[test]
+    fn test_select_cached_catalog_same_version() {
+        let cached = ModelCatalogProviderCache {
+            cli_version: "1.2.3".into(),
+            updated_at: 123,
+            providers: vec![ModelCatalogProvider {
+                provider: "openrouter".into(),
+                base_url: None,
+                models: vec![ModelCatalogModel {
+                    id: "moonshotai/kimi-k2.5".into(),
+                    name: Some("Kimi".into()),
+                }],
+            }],
+            source: "openclaw models list --all --json".into(),
+            error: None,
+        };
+        let selected = select_catalog_from_cache(Some(&cached), "1.2.3");
+        assert!(selected.is_some(), "same version should use cache");
     }
 
-    if let Some(auth_profiles) = cfg.pointer("/auth/profiles").and_then(Value::as_object) {
-        for profile in auth_profiles.values() {
-            if let Some(provider_name) = profile
-                .get("provider")
-                .or_else(|| profile.get("name"))
-                .and_then(Value::as_str)
-            {
-                providers.entry(provider_name.to_string())
-                    .or_insert(ModelCatalogProvider {
-                        provider: provider_name.to_string(),
-                        base_url: None,
-                        models: Vec::new(),
-                    });
-            }
-        }
+    #[test]
+    fn test_select_cached_catalog_version_mismatch_requires_refresh() {
+        let cached = ModelCatalogProviderCache {
+            cli_version: "1.2.2".into(),
+            updated_at: 123,
+            providers: vec![ModelCatalogProvider {
+                provider: "openrouter".into(),
+                base_url: None,
+                models: vec![ModelCatalogModel {
+                    id: "moonshotai/kimi-k2.5".into(),
+                    name: Some("Kimi".into()),
+                }],
+            }],
+            source: "openclaw models list --all --json".into(),
+            error: None,
+        };
+        let selected = select_catalog_from_cache(Some(&cached), "1.2.3");
+        assert!(selected.is_none(), "version mismatch must force CLI refresh");
     }
-
-    providers.into_values().collect()
 }
 
-fn extract_catalog_models(provider_cfg: &Value) -> Option<Vec<ModelCatalogModel>> {
-    let mut model_items: BTreeMap<String, String> = BTreeMap::new();
-    let raw_models = provider_cfg.get("models")?.as_array()?;
-    for model in raw_models {
-        let id = model.as_str().map(str::to_string).or_else(|| {
-            model
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        if let Some(id) = id {
-            let name = model
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            model_items.entry(id).or_insert(name.unwrap_or_default());
+#[cfg(test)]
+mod model_value_tests {
+    use super::*;
+
+    fn profile(provider: &str, model: &str) -> ModelProfile {
+        ModelProfile {
+            id: "p1".into(),
+            name: "p".into(),
+            provider: provider.into(),
+            model: model.into(),
+            auth_ref: "".into(),
+            api_key: None,
+            base_url: None,
+            description: None,
+            enabled: true,
         }
     }
-    if model_items.is_empty() {
-        return None;
+
+    #[test]
+    fn test_profile_to_model_value_keeps_provider_prefix_for_nested_model_id() {
+        let p = profile("openrouter", "moonshotai/kimi-k2.5");
+        assert_eq!(
+            profile_to_model_value(&p),
+            "openrouter/moonshotai/kimi-k2.5",
+        );
     }
-    let models = model_items
+}
+
+#[cfg(test)]
+mod rescue_bot_tests {
+    use super::*;
+
+    #[test]
+    fn test_suggest_rescue_port_prefers_large_gap() {
+        assert_eq!(suggest_rescue_port(18789), 19789);
+    }
+
+    #[test]
+    fn test_ensure_rescue_port_spacing_rejects_small_gap() {
+        let err = ensure_rescue_port_spacing(18789, 18800).unwrap_err();
+        assert!(err.contains("at least 20"));
+    }
+
+    #[test]
+    fn test_build_rescue_bot_command_plan_for_activate() {
+        let commands = build_rescue_bot_command_plan(
+            RescueBotAction::Activate,
+            "rescue",
+            19789,
+            true,
+        );
+        let expected = vec![
+            vec!["--profile", "rescue", "setup"],
+            vec![
+                "--profile",
+                "rescue",
+                "config",
+                "set",
+                "gateway.port",
+                "19789",
+                "--json",
+            ],
+            vec!["--profile", "rescue", "gateway", "install"],
+            vec!["--profile", "rescue", "gateway", "restart"],
+            vec![
+                "--profile",
+                "rescue",
+                "gateway",
+                "status",
+                "--no-probe",
+                "--json",
+            ],
+        ]
         .into_iter()
-        .map(|(id, name)| ModelCatalogModel {
-            id,
-            name: (!name.is_empty()).then_some(name),
-        })
-        .collect();
-    Some(models)
+        .map(|items| items.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(commands, expected);
+    }
+
+    #[test]
+    fn test_build_rescue_bot_command_plan_for_activate_without_reconfigure() {
+        let commands = build_rescue_bot_command_plan(
+            RescueBotAction::Activate,
+            "rescue",
+            19789,
+            false,
+        );
+        let expected = vec![
+            vec!["--profile", "rescue", "gateway", "install"],
+            vec!["--profile", "rescue", "gateway", "restart"],
+            vec![
+                "--profile",
+                "rescue",
+                "gateway",
+                "status",
+                "--no-probe",
+                "--json",
+            ],
+        ]
+        .into_iter()
+        .map(|items| items.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(commands, expected);
+    }
+
+    #[test]
+    fn test_build_rescue_bot_command_plan_for_unset() {
+        let commands = build_rescue_bot_command_plan(RescueBotAction::Unset, "rescue", 19789, false);
+        let expected = vec![
+            vec!["--profile", "rescue", "gateway", "stop"],
+            vec!["--profile", "rescue", "gateway", "uninstall"],
+            vec![
+                "--profile",
+                "rescue",
+                "config",
+                "unset",
+                "gateway.port",
+            ],
+        ]
+        .into_iter()
+        .map(|items| items.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        assert_eq!(commands, expected);
+    }
+
+    #[test]
+    fn test_parse_rescue_bot_action_unset_aliases() {
+        assert_eq!(RescueBotAction::parse("unset").unwrap(), RescueBotAction::Unset);
+        assert_eq!(RescueBotAction::parse("remove").unwrap(), RescueBotAction::Unset);
+        assert_eq!(RescueBotAction::parse("delete").unwrap(), RescueBotAction::Unset);
+    }
+
+    #[test]
+    fn test_is_rescue_cleanup_noop_matches_stop_not_running() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "Gateway is not running".into(),
+            exit_code: 1,
+        };
+        let command = vec![
+            "--profile".to_string(),
+            "rescue".to_string(),
+            "gateway".to_string(),
+            "stop".to_string(),
+        ];
+        assert!(is_rescue_cleanup_noop(
+            RescueBotAction::Deactivate,
+            &command,
+            &output
+        ));
+    }
+
+    #[test]
+    fn test_is_rescue_cleanup_noop_matches_unset_missing_key() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "config key gateway.port not found".into(),
+            exit_code: 1,
+        };
+        let command = vec![
+            "--profile".to_string(),
+            "rescue".to_string(),
+            "config".to_string(),
+            "unset".to_string(),
+            "gateway.port".to_string(),
+        ];
+        assert!(is_rescue_cleanup_noop(
+            RescueBotAction::Unset,
+            &command,
+            &output
+        ));
+    }
+
+    #[test]
+    fn test_is_gateway_restart_timeout_matches_health_check_timeout() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "Gateway restart timed out after 60s waiting for health checks.".into(),
+            exit_code: 1,
+        };
+        assert!(is_gateway_restart_timeout(&output));
+    }
+
+    #[test]
+    fn test_is_gateway_restart_timeout_ignores_other_errors() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "gateway start failed: address already in use".into(),
+            exit_code: 1,
+        };
+        assert!(!is_gateway_restart_timeout(&output));
+    }
+
+    #[test]
+    fn test_is_doctor_json_option_unsupported_matches_unknown_option() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "error: unknown option '--json'".into(),
+            exit_code: 1,
+        };
+        assert!(is_doctor_json_option_unsupported(&output));
+    }
+
+    #[test]
+    fn test_is_doctor_json_option_unsupported_ignores_other_failures() {
+        let output = OpenclawCommandOutput {
+            stdout: String::new(),
+            stderr: "doctor command failed to connect".into(),
+            exit_code: 1,
+        };
+        assert!(!is_doctor_json_option_unsupported(&output));
+    }
+
+    #[test]
+    fn test_parse_doctor_issues_reads_camel_case_fields() {
+        let report = serde_json::json!({
+            "issues": [
+                {
+                    "id": "primary.test",
+                    "code": "primary.test",
+                    "severity": "warn",
+                    "message": "test issue",
+                    "autoFixable": true,
+                    "fixHint": "do thing"
+                }
+            ]
+        });
+        let issues = parse_doctor_issues(&report, "primary");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "primary.test");
+        assert_eq!(issues[0].severity, "warn");
+        assert!(issues[0].auto_fixable);
+        assert_eq!(issues[0].fix_hint.as_deref(), Some("do thing"));
+    }
+
+    #[test]
+    fn test_extract_json_from_output_uses_trailing_balanced_payload() {
+        let raw = "[plugins] warmup cache\n[warn] using fallback transport\n{\"ok\":false,\"issues\":[{\"id\":\"x\"}]}";
+        let json = extract_json_from_output(raw).unwrap();
+        assert_eq!(json, "{\"ok\":false,\"issues\":[{\"id\":\"x\"}]}");
+    }
+
+    #[test]
+    fn test_parse_json_loose_handles_leading_bracketed_logs() {
+        let raw = "[plugins] warmup cache\n[warn] using fallback transport\n{\"running\":false,\"healthy\":false}";
+        let parsed = parse_json_loose(raw).expect("expected trailing JSON payload");
+        assert_eq!(parsed.get("running").and_then(Value::as_bool), Some(false));
+        assert_eq!(parsed.get("healthy").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn test_classify_rescue_primary_status_prioritizes_error() {
+        let issues = vec![
+            RescuePrimaryIssue {
+                id: "a".into(),
+                code: "a".into(),
+                severity: "warn".into(),
+                message: "warn".into(),
+                auto_fixable: false,
+                fix_hint: None,
+                source: "primary".into(),
+            },
+            RescuePrimaryIssue {
+                id: "b".into(),
+                code: "b".into(),
+                severity: "error".into(),
+                message: "error".into(),
+                auto_fixable: false,
+                fix_hint: None,
+                source: "primary".into(),
+            },
+        ];
+        assert_eq!(classify_rescue_primary_status(&issues), "broken");
+    }
+
+    #[test]
+    fn test_collect_safe_primary_issue_ids_filters_non_primary_and_non_fixable() {
+        let diagnosis = RescuePrimaryDiagnosisResult {
+            status: "degraded".into(),
+            checked_at: "2026-02-25T00:00:00Z".into(),
+            target_profile: "primary".into(),
+            rescue_profile: "rescue".into(),
+            rescue_configured: true,
+            rescue_port: Some(19789),
+            checks: Vec::new(),
+            issues: vec![
+                RescuePrimaryIssue {
+                    id: "field.agents".into(),
+                    code: "required.field".into(),
+                    severity: "warn".into(),
+                    message: "missing agents".into(),
+                    auto_fixable: true,
+                    fix_hint: None,
+                    source: "primary".into(),
+                },
+                RescuePrimaryIssue {
+                    id: "field.port".into(),
+                    code: "invalid.port".into(),
+                    severity: "error".into(),
+                    message: "port invalid".into(),
+                    auto_fixable: false,
+                    fix_hint: None,
+                    source: "primary".into(),
+                },
+                RescuePrimaryIssue {
+                    id: "rescue.gateway.unhealthy".into(),
+                    code: "rescue.gateway.unhealthy".into(),
+                    severity: "warn".into(),
+                    message: "rescue unhealthy".into(),
+                    auto_fixable: true,
+                    fix_hint: None,
+                    source: "rescue".into(),
+                },
+            ],
+        };
+
+        let (selected, skipped) = collect_safe_primary_issue_ids(
+            &diagnosis,
+            &[
+                "field.agents".into(),
+                "field.port".into(),
+                "rescue.gateway.unhealthy".into(),
+            ],
+        );
+        assert_eq!(selected, vec!["field.agents"]);
+        assert_eq!(skipped, vec!["field.port", "rescue.gateway.unhealthy"]);
+    }
+
+    #[test]
+    fn test_build_primary_issue_fix_command_for_field_port() {
+        let (_, command) = build_primary_issue_fix_command("primary", "field.port")
+            .expect("field.port should have safe fix command");
+        assert_eq!(
+            command,
+            vec![
+                "--profile",
+                "primary",
+                "config",
+                "set",
+                "gateway.port",
+                "18789",
+                "--json"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
 }
 
 fn collect_channel_nodes(cfg: &Value) -> Vec<ChannelNode> {
@@ -3599,6 +5623,10 @@ fn collect_agent_ids(cfg: &Value) -> Vec<String> {
             }
         }
     }
+    // Implicit "main" agent when no agents.list
+    if ids.is_empty() {
+        ids.push("main".into());
+    }
     ids
 }
 
@@ -3703,95 +5731,10 @@ pub fn read_raw_config() -> Result<String, String> {
     serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())
 }
 
-// ---- Config baseline for dirty tracking ----
-
-fn baseline_path(paths: &crate::models::OpenClawPaths) -> std::path::PathBuf {
-    paths.clawpal_dir.join("config-baseline.json")
-}
-
-#[tauri::command]
-pub fn save_config_baseline() -> Result<bool, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let bp = baseline_path(&paths);
-    fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
-    fs::write(&bp, text).map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfigDirtyState {
-    pub dirty: bool,
-    pub baseline: String,
-    pub current: String,
-}
-
-#[tauri::command]
-pub fn check_config_dirty() -> Result<ConfigDirtyState, String> {
-    let paths = resolve_paths();
-    let cfg = read_openclaw_config(&paths)?;
-    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let bp = baseline_path(&paths);
-    let baseline = if bp.exists() {
-        fs::read_to_string(&bp).map_err(|e| e.to_string())?
-    } else {
-        // No baseline yet — treat current as clean, save it
-        fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
-        fs::write(&bp, &current).map_err(|e| e.to_string())?;
-        current.clone()
-    };
-    let dirty = baseline.trim() != current.trim();
-    Ok(ConfigDirtyState { dirty, baseline, current })
-}
-
-#[tauri::command]
-pub fn discard_config_changes() -> Result<bool, String> {
-    let paths = resolve_paths();
-    let bp = baseline_path(&paths);
-    if !bp.exists() {
-        return Err("No baseline config found".into());
-    }
-    let baseline_text = fs::read_to_string(&bp).map_err(|e| e.to_string())?;
-    let baseline: Value = serde_json::from_str(&baseline_text).map_err(|e| e.to_string())?;
-
-    // Save current as snapshot before discarding
-    let cfg = read_openclaw_config(&paths)?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let _ = add_snapshot(
-        &paths.history_dir,
-        &paths.metadata_path,
-        None,
-        "discard-changes",
-        true,
-        &current_text,
-        None,
-    );
-
-    write_json(&paths.config_path, &baseline)?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub async fn apply_pending_changes() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let paths = resolve_paths();
-        // Save current config as new baseline
-        let cfg = read_openclaw_config(&paths)?;
-        let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-        let bp = baseline_path(&paths);
-        fs::create_dir_all(bp.parent().unwrap()).map_err(|e| e.to_string())?;
-        fs::write(&bp, &text).map_err(|e| e.to_string())?;
-
-        // Restart gateway (30s timeout to prevent indefinite hang)
-        run_openclaw_raw_timeout(&["gateway", "restart"], Some(30))?;
-        Ok(true)
-    }).await.map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-pub fn resolve_full_api_key(profile_id: String) -> Result<String, String> {
+// resolve_full_api_key is intentionally not exposed as a Tauri command.
+// It returns raw API keys which should never be sent to the frontend.
+#[allow(dead_code)]
+fn resolve_full_api_key(profile_id: String) -> Result<String, String> {
     let paths = resolve_paths();
     let profiles = load_model_profiles(&paths);
     let profile = profiles.iter().find(|p| p.id == profile_id)
@@ -3805,8 +5748,17 @@ pub fn resolve_full_api_key(profile_id: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
-    if url.trim().is_empty() {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
         return Err("URL is required".into());
+    }
+    // Allow http(s) URLs and local paths within user home directory
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        // For local paths, ensure they don't execute apps
+        let path = std::path::Path::new(trimmed);
+        if path.extension().map_or(false, |ext| ext == "app" || ext == "exe") {
+            return Err("Cannot open application files".into());
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -4080,17 +6032,18 @@ pub async fn remote_backup_before_upgrade(
         .map(|dt| dt.format("%Y-%m-%d_%H%M%S").to_string())
         .unwrap_or_else(|| format!("{now_secs}"));
 
+    let escaped_name = shell_escape(&name);
     let cmd = format!(
         concat!(
             "set -e; ",
-            "BDIR=\"$HOME/.clawpal/backups/{name}\"; ",
+            "BDIR=\"$HOME/.clawpal/backups/\"{name}; ",
             "mkdir -p \"$BDIR\"; ",
             "cp \"$HOME/.openclaw/openclaw.json\" \"$BDIR/\" 2>/dev/null || true; ",
             "cp -r \"$HOME/.openclaw/agents\" \"$BDIR/\" 2>/dev/null || true; ",
             "cp -r \"$HOME/.openclaw/memory\" \"$BDIR/\" 2>/dev/null || true; ",
             "du -sk \"$BDIR\" 2>/dev/null | awk '{{print $1 * 1024}}' || echo 0"
         ),
-        name = name
+        name = escaped_name
     );
 
     let result = pool.exec_login(&host_id, &cmd).await?;
@@ -4182,17 +6135,18 @@ pub async fn remote_restore_from_backup(
     host_id: String,
     backup_name: String,
 ) -> Result<String, String> {
+    let escaped_name = shell_escape(&backup_name);
     let cmd = format!(
         concat!(
             "set -e; ",
-            "BDIR=\"$HOME/.clawpal/backups/{name}\"; ",
+            "BDIR=\"$HOME/.clawpal/backups/\"{name}; ",
             "[ -d \"$BDIR\" ] || {{ echo 'Backup not found'; exit 1; }}; ",
             "cp \"$BDIR/openclaw.json\" \"$HOME/.openclaw/openclaw.json\" 2>/dev/null || true; ",
             "[ -d \"$BDIR/agents\" ] && cp -r \"$BDIR/agents\" \"$HOME/.openclaw/\" 2>/dev/null || true; ",
             "[ -d \"$BDIR/memory\" ] && cp -r \"$BDIR/memory\" \"$HOME/.openclaw/\" 2>/dev/null || true; ",
-            "echo 'Restored from backup '\"'\"'{name}'\"'\"''"
+            "echo 'Restored from backup '{name}"
         ),
-        name = backup_name
+        name = escaped_name
     );
 
     let result = pool.exec_login(&host_id, &cmd).await?;
@@ -4209,9 +6163,10 @@ pub async fn remote_delete_backup(
     host_id: String,
     backup_name: String,
 ) -> Result<bool, String> {
+    let escaped_name = shell_escape(&backup_name);
     let cmd = format!(
-        "BDIR=\"$HOME/.clawpal/backups/{name}\"; [ -d \"$BDIR\" ] && rm -rf \"$BDIR\" && echo 'deleted' || echo 'not_found'",
-        name = backup_name
+        "BDIR=\"$HOME/.clawpal/backups/\"{name}; [ -d \"$BDIR\" ] && rm -rf \"$BDIR\" && echo 'deleted' || echo 'not_found'",
+        name = escaped_name
     );
 
     let result = pool.exec_login(&host_id, &cmd).await?;
@@ -4251,6 +6206,288 @@ fn remote_instances_path() -> PathBuf {
     resolve_paths().clawpal_dir.join("remote-instances.json")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfigHostSuggestion {
+    pub host_alias: String,
+    pub host_name: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+}
+
+fn ssh_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".ssh").join("config"))
+}
+
+fn push_ssh_config_hosts(
+    out: &mut Vec<SshConfigHostSuggestion>,
+    aliases: &[String],
+    host_name: &Option<String>,
+    user: &Option<String>,
+    port: &Option<u16>,
+    identity_file: &Option<String>,
+) {
+    for alias in aliases {
+        if alias.is_empty() || alias == "*" || alias.starts_with('!') || alias.contains('*') || alias.contains('?') {
+            continue;
+        }
+        out.push(SshConfigHostSuggestion {
+            host_alias: alias.clone(),
+            host_name: host_name.clone(),
+            user: user.clone(),
+            port: *port,
+            identity_file: identity_file.clone(),
+        });
+    }
+}
+
+fn parse_quoted_ssh_value(mut value: &str) -> String {
+    value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn strip_ssh_comment(value: &str) -> String {
+    let mut output = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in value.chars() {
+        if escaped {
+            output.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            output.push(ch);
+            escaped = true;
+            continue;
+        }
+
+        if quote.is_some() {
+            if quote == Some(ch) {
+                quote = None;
+            }
+            output.push(ch);
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '#' {
+            break;
+        }
+
+        output.push(ch);
+    }
+
+    output.trim().to_string()
+}
+
+fn parse_ssh_config_entry(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let mut sep = None;
+    let mut quote: Option<char> = None;
+
+    for (idx, ch) in line.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+
+        if ch == '=' {
+            sep = Some((idx, true));
+            break;
+        }
+
+        if ch.is_whitespace() {
+            sep = Some((idx, false));
+            break;
+        }
+    }
+
+    let Some((sep_idx, is_eq)) = sep else {
+        return None;
+    };
+
+    let key = line[..sep_idx].trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+
+    let raw_value = if is_eq {
+        line[sep_idx + 1..].trim()
+    } else {
+        line[sep_idx..].trim()
+    };
+    if raw_value.is_empty() {
+        return None;
+    }
+
+    let value = parse_quoted_ssh_value(&strip_ssh_comment(raw_value));
+    if value.is_empty() {
+        None
+    } else {
+        Some((key, value))
+    }
+}
+
+fn split_host_aliases(value: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in value.trim().chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+                continue;
+            }
+            current.push(ch);
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                aliases.push(current.clone());
+                current.clear();
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        aliases.push(current);
+    }
+
+    aliases
+}
+
+fn parse_ssh_config_hosts(data: &str) -> Vec<SshConfigHostSuggestion> {
+    let mut out = Vec::new();
+    let mut aliases: Vec<String> = Vec::new();
+    let mut host_name: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut identity_file: Option<String> = None;
+
+    for raw in data.lines() {
+        let Some((key, value)) = parse_ssh_config_entry(raw) else {
+            continue;
+        };
+
+        if key == "host" {
+            if !aliases.is_empty() {
+                push_ssh_config_hosts(
+                    &mut out,
+                    &aliases,
+                    &host_name,
+                    &user,
+                    &port,
+                    &identity_file,
+                );
+            }
+            aliases = split_host_aliases(&value)
+                .into_iter()
+                .filter(|v| !v.is_empty())
+                .collect();
+            host_name = None;
+            user = None;
+            port = None;
+            identity_file = None;
+            continue;
+        }
+
+        if aliases.is_empty() {
+            continue;
+        }
+
+        match key.as_str() {
+            "hostname" => {
+                if host_name.is_none() {
+                    host_name = Some(value.to_string());
+                }
+            }
+            "user" => {
+                if user.is_none() {
+                    user = Some(value.to_string());
+                }
+            }
+            "port" => {
+                if port.is_none() {
+                    port = value.parse::<u16>().ok();
+                }
+            }
+            "identityfile" => {
+                if identity_file.is_none() {
+                    identity_file = Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !aliases.is_empty() {
+        push_ssh_config_hosts(
+            &mut out,
+            &aliases,
+            &host_name,
+            &user,
+            &port,
+            &identity_file,
+        );
+    }
+
+    let mut dedup = std::collections::BTreeMap::new();
+    for entry in out {
+        dedup.entry(entry.host_alias.clone()).or_insert(entry);
+    }
+    dedup.into_values().collect()
+}
+
 fn read_hosts_from_disk() -> Result<Vec<SshHostConfig>, String> {
     let path = remote_instances_path();
     if !path.exists() {
@@ -4266,12 +6503,31 @@ fn write_hosts_to_disk(hosts: &[SshHostConfig]) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {e}"))?;
     }
     let json = serde_json::to_string_pretty(hosts).map_err(|e| format!("Failed to serialize hosts: {e}"))?;
-    fs::write(&path, json).map_err(|e| format!("Failed to write remote-instances.json: {e}"))
+    fs::write(&path, &json).map_err(|e| format!("Failed to write remote-instances.json: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn list_ssh_hosts() -> Result<Vec<SshHostConfig>, String> {
     read_hosts_from_disk()
+}
+
+#[tauri::command]
+pub fn list_ssh_config_hosts() -> Result<Vec<SshConfigHostSuggestion>, String> {
+    let Some(path) = ssh_config_path() else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    Ok(parse_ssh_config_hosts(&data))
 }
 
 #[tauri::command]
@@ -4310,6 +6566,25 @@ pub async fn ssh_connect(pool: State<'_, SshConnectionPool>, host_id: String) ->
     let host = hosts.into_iter().find(|h| h.id == host_id)
         .ok_or_else(|| format!("No SSH host config with id: {host_id}"))?;
     pool.connect(&host).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn ssh_connect_with_passphrase(
+    pool: State<'_, SshConnectionPool>,
+    host_id: String,
+    passphrase: String,
+) -> Result<bool, String> {
+    if pool.is_connected(&host_id).await {
+        return Ok(true);
+    }
+    let hosts = read_hosts_from_disk()?;
+    let host = hosts
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("No SSH host config with id: {host_id}"))?;
+    pool.connect_with_passphrase(&host, Some(passphrase.as_str()))
+        .await?;
     Ok(true)
 }
 
@@ -4365,56 +6640,103 @@ pub async fn sftp_remove_file(pool: State<'_, SshConnectionPool>, host_id: Strin
 
 #[tauri::command]
 pub async fn remote_read_raw_config(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<String, String> {
+    // openclaw config get requires a path — there's no way to dump the full config via CLI.
+    // Use sftp_read directly since this function's purpose is returning the entire raw config.
     pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await
 }
 
 #[tauri::command]
-pub async fn remote_get_system_status(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Value, String> {
-    // 1. Get openclaw version (use login shell for PATH) — don't fail if binary not found
-    let openclaw_version = match pool.exec_login(&host_id, "openclaw --version").await {
-        Ok(r) if r.exit_code == 0 => r.stdout.trim().to_string(),
-        Ok(r) => r.stdout.trim().to_string(), // might have partial output
-        Err(_) => String::new(),
-    };
+pub async fn remote_get_system_status(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<StatusLight, String> {
+    // Tier 1: fast, essential — health check + agents config (2 SSH calls in parallel)
+    let (config_res, pgrep_res) = tokio::join!(
+        crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["config", "get", "agents", "--json"]),
+        pool.exec(&host_id, "pgrep -f '[o]penclaw-gateway' >/dev/null 2>&1"),
+    );
 
-    // 2. Read remote config
-    let config_raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await;
-    let (active_agents, global_default_model, _gateway_port) = match &config_raw {
-        Ok(raw) => {
-            let cfg: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-            let agents = cfg.pointer("/agents/list")
+    let config_ok = matches!(&config_res, Ok(output) if output.exit_code == 0);
+
+    let (active_agents, global_default_model, fallback_models) = match config_res {
+        Ok(ref output) if output.exit_code == 0 => {
+            let cfg: Value = crate::cli_runner::parse_json_output(output).unwrap_or(Value::Null);
+            let explicit = cfg.pointer("/list")
                 .and_then(Value::as_array)
                 .map(|a| a.len() as u32)
                 .unwrap_or(0);
-            let model = cfg.pointer("/agents/defaults/model")
+            let agents = if explicit == 0 { 1 } else { explicit };
+            let model = cfg.pointer("/defaults/model")
                 .and_then(|v| read_model_value(v))
-                .or_else(|| cfg.pointer("/agents/default/model").and_then(|v| read_model_value(v)))
+                .or_else(|| cfg.pointer("/default/model").and_then(|v| read_model_value(v)));
+            let fallbacks = cfg.pointer("/defaults/model/fallbacks")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
                 .unwrap_or_default();
-            let port = cfg.pointer("/gateway/port")
-                .and_then(Value::as_u64)
-                .unwrap_or(5337);
-            (agents, model, port)
+            (agents, model, fallbacks)
         }
-        Err(_) => (0, String::new(), 5337),
+        _ => (0, None, Vec::new()),
     };
 
-    // 3. Check gateway health — pgrep is most reliable via SSH; HTTP as fallback
-    let pgrep_result = pool.exec(&host_id, "pgrep -f openclaw-gateway >/dev/null 2>&1").await;
-    let healthy = match pgrep_result {
+    // Avoid false negatives from transient SSH exec failures:
+    // if health probe fails but config fetch in the same cycle succeeded,
+    // keep health as true instead of flipping to unhealthy.
+    let healthy = match pgrep_res {
         Ok(r) => r.exit_code == 0,
+        Err(_) if config_ok => true,
         Err(_) => false,
     };
 
-    let status = serde_json::json!({
-        "healthy": healthy,
-        "openclawVersion": openclaw_version,
-        "activeAgents": active_agents,
-        "globalDefaultModel": global_default_model,
-        "configPath": "~/.openclaw/openclaw.json",
-        "openclawDir": "~/.openclaw",
-    });
+    Ok(StatusLight {
+        healthy,
+        active_agents,
+        global_default_model,
+        fallback_models,
+    })
+}
 
-    Ok(status)
+/// Tier 2: slow, optional — openclaw version + duplicate detection (2 SSH calls in parallel).
+/// Called once on mount and on-demand (e.g., after upgrade), not in poll loop.
+#[tauri::command]
+pub async fn remote_get_status_extra(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<StatusExtra, String> {
+    let detect_duplicates_script = concat!(
+        "seen=''; for p in $(which -a openclaw 2>/dev/null) ",
+        "\"$HOME/.npm-global/bin/openclaw\" \"/usr/local/bin/openclaw\" \"/opt/homebrew/bin/openclaw\"; do ",
+        "[ -x \"$p\" ] || continue; ",
+        "rp=$(readlink -f \"$p\" 2>/dev/null || echo \"$p\"); ",
+        "echo \"$seen\" | grep -qF \"$rp\" && continue; ",
+        "seen=\"$seen $rp\"; ",
+        "v=$($p --version 2>/dev/null || echo 'unknown'); ",
+        "echo \"$p: $v\"; ",
+        "done"
+    );
+
+    let (version_res, dup_res) = tokio::join!(
+        pool.exec_login(&host_id, "openclaw --version"),
+        pool.exec_login(&host_id, detect_duplicates_script),
+    );
+
+    let openclaw_version = match version_res {
+        Ok(r) if r.exit_code == 0 => Some(r.stdout.trim().to_string()),
+        Ok(r) => {
+            let trimmed = r.stdout.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+        Err(_) => None,
+    };
+
+    let duplicate_installs = match dup_res {
+        Ok(r) => {
+            let entries: Vec<String> = r.stdout.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if entries.len() > 1 { entries } else { Vec::new() }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    Ok(StatusExtra {
+        openclaw_version,
+        duplicate_installs,
+    })
 }
 
 #[tauri::command]
@@ -4462,82 +6784,54 @@ pub async fn remote_check_openclaw_update(
 
 #[tauri::command]
 pub async fn remote_list_agents_overview(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Vec<AgentOverview>, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))?;
-
-    // Check if gateway process is running to determine online status
-    let gateway_running = pool.exec(&host_id, "pgrep -f openclaw-gateway >/dev/null 2>&1").await
-        .map(|r| r.exit_code == 0)
-        .unwrap_or(false);
-
-    let mut agents = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-    let default_model = cfg.pointer("/agents/defaults/model")
-        .and_then(read_model_value)
-        .or_else(|| cfg.pointer("/agents/default/model").and_then(read_model_value));
-    let default_workspace = cfg.pointer("/agents/defaults/workspace")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
-    let channel_nodes = collect_channel_nodes(&cfg);
-
-    if let Some(list) = cfg.pointer("/agents/list").and_then(Value::as_array) {
-        for agent in list {
-            let id = agent.get("id").and_then(Value::as_str).unwrap_or("agent").to_string();
-            if !seen_ids.insert(id.clone()) {
-                continue;
-            }
-
-            let workspace = agent.get("workspace").and_then(Value::as_str)
-                .map(|s| s.to_string())
-                .or_else(|| default_workspace.clone());
-
-            // Read IDENTITY.md from remote workspace via SFTP
-            let (name, emoji) = if let Some(ref ws) = workspace {
-                let identity_path = format!("{}/IDENTITY.md", ws.trim_end_matches('/'));
-                match pool.sftp_read(&host_id, &identity_path).await {
-                    Ok(content) => parse_identity_content(&content),
-                    Err(_) => (None, None),
-                }
-            } else {
-                (None, None)
-            };
-
-            let model = agent.get("model").and_then(read_model_value)
-                .or_else(|| default_model.clone());
-            let channels: Vec<String> = channel_nodes.iter()
-                .map(|ch| ch.path.clone())
-                .collect();
-            agents.push(AgentOverview {
-                id,
-                name,
-                emoji,
-                model,
-                channels,
-                online: gateway_running,
-                workspace,
-            });
+    let output = crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["agents", "list", "--json"]).await?;
+    let json = crate::cli_runner::parse_json_output(&output)?;
+    // Check which agents have sessions remotely (single command, batch check)
+    // Lists agents whose sessions.json is larger than 2 bytes (not just "{}")
+    let online_set = match pool.exec_login(
+        &host_id,
+        "for d in ~/.openclaw/agents/*/sessions/sessions.json; do [ -f \"$d\" ] && [ $(wc -c < \"$d\") -gt 2 ] && basename $(dirname $(dirname \"$d\")); done",
+    ).await {
+        Ok(result) => {
+            result.stdout.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<std::collections::HashSet<String>>()
         }
-    }
-    Ok(agents)
+        Err(_) => std::collections::HashSet::new(), // fallback: all offline
+    };
+    parse_agents_cli_output(&json, Some(&online_set))
 }
 
 #[tauri::command]
 pub async fn remote_list_channels_minimal(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Vec<ChannelNode>, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))?;
+    let output = crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["config", "get", "channels", "--json"]).await?;
+    // channels key might not exist yet
+    if output.exit_code != 0 {
+        let msg = format!("{} {}", output.stderr, output.stdout).to_lowercase();
+        if msg.contains("not found") {
+            return Ok(Vec::new());
+        }
+        return Err(format!("openclaw config get channels failed: {}", output.stderr));
+    }
+    let channels_val = crate::cli_runner::parse_json_output(&output).unwrap_or(Value::Null);
+    // Wrap in top-level object with "channels" key so collect_channel_nodes works
+    let cfg = serde_json::json!({ "channels": channels_val });
     Ok(collect_channel_nodes(&cfg))
 }
 
 #[tauri::command]
 pub async fn remote_list_bindings(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Vec<Value>, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))?;
-    let bindings = cfg
-        .get("bindings")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(bindings)
+    let output = crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["config", "get", "bindings", "--json"]).await?;
+    // "bindings" may not exist yet — treat non-zero exit with "not found" as empty
+    if output.exit_code != 0 {
+        let msg = format!("{} {}", output.stderr, output.stdout).to_lowercase();
+        if msg.contains("not found") {
+            return Ok(Vec::new());
+        }
+    }
+    let json = crate::cli_runner::parse_json_output(&output)?;
+    Ok(json.as_array().cloned().unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -4577,78 +6871,201 @@ pub async fn remote_restart_gateway(
 }
 
 #[tauri::command]
-pub async fn remote_save_config_baseline(
+pub async fn remote_manage_rescue_bot(
     pool: State<'_, SshConnectionPool>,
-    baselines: State<'_, RemoteConfigBaselines>,
     host_id: String,
-) -> Result<bool, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("Failed to parse remote config: {e}"))?;
-    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    baselines.0.lock().unwrap().insert(host_id, text);
-    Ok(true)
-}
+    action: String,
+    profile: Option<String>,
+    rescue_port: Option<u16>,
+) -> Result<RescueBotManageResult, String> {
+    let action = RescueBotAction::parse(&action)?;
+    let profile = profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("rescue")
+        .to_string();
 
-#[tauri::command]
-pub async fn remote_check_config_dirty(
-    pool: State<'_, SshConnectionPool>,
-    baselines: State<'_, RemoteConfigBaselines>,
-    host_id: String,
-) -> Result<ConfigDirtyState, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("Failed to parse remote config: {e}"))?;
-    let current = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    let mut map = baselines.0.lock().unwrap();
-    let baseline = match map.get(&host_id) {
-        Some(b) => b.clone(),
-        None => {
-            // No baseline yet — treat current as clean, save it
-            map.insert(host_id, current.clone());
-            current.clone()
+    let main_port = pool
+        .sftp_read(&host_id, "~/.openclaw/openclaw.json")
+        .await
+        .ok()
+        .and_then(|raw| json5::from_str::<Value>(&raw).ok())
+        .map(|cfg| resolve_gateway_port_from_config(&cfg))
+        .unwrap_or(18789);
+    let (already_configured, existing_port) =
+        resolve_remote_rescue_profile_state(&pool, &host_id, &profile).await?;
+    let should_configure = !already_configured || action == RescueBotAction::Set;
+    let rescue_port = if should_configure {
+        rescue_port.unwrap_or_else(|| suggest_rescue_port(main_port))
+    } else {
+        existing_port
+            .or(rescue_port)
+            .unwrap_or_else(|| suggest_rescue_port(main_port))
+    };
+    let min_recommended_port = main_port.saturating_add(20);
+
+    if should_configure && matches!(action, RescueBotAction::Set | RescueBotAction::Activate) {
+        ensure_rescue_port_spacing(main_port, rescue_port)?;
+    }
+
+    if action == RescueBotAction::Status && !already_configured {
+        return Ok(RescueBotManageResult {
+            action: action.as_str().into(),
+            profile,
+            main_port,
+            rescue_port,
+            min_recommended_port,
+            was_already_configured: false,
+            commands: Vec::new(),
+        });
+    }
+
+    let plan = build_rescue_bot_command_plan(action, &profile, rescue_port, should_configure);
+    let mut commands = Vec::new();
+    for command in plan {
+        let result = run_remote_rescue_bot_command(&pool, &host_id, command).await?;
+        if result.output.exit_code != 0 {
+            if action == RescueBotAction::Status {
+                commands.push(result);
+                break;
+            }
+            if is_rescue_cleanup_noop(action, &result.command, &result.output) {
+                commands.push(result);
+                continue;
+            }
+            if action == RescueBotAction::Activate
+                && is_gateway_restart_command(&result.command)
+                && is_gateway_restart_timeout(&result.output)
+            {
+                commands.push(result);
+                run_remote_gateway_restart_fallback(&pool, &host_id, &profile, &mut commands)
+                    .await?;
+                continue;
+            }
+            return Err(command_failure_message(&result.command, &result.output));
         }
-    };
-    let dirty = baseline.trim() != current.trim();
-    Ok(ConfigDirtyState { dirty, baseline, current })
+        commands.push(result);
+    }
+
+    Ok(RescueBotManageResult {
+        action: action.as_str().into(),
+        profile,
+        main_port,
+        rescue_port,
+        min_recommended_port,
+        was_already_configured: already_configured,
+        commands,
+    })
 }
 
 #[tauri::command]
-pub async fn remote_discard_config_changes(
+pub async fn remote_diagnose_primary_via_rescue(
     pool: State<'_, SshConnectionPool>,
-    baselines: State<'_, RemoteConfigBaselines>,
     host_id: String,
-) -> Result<bool, String> {
-    let baseline = {
-        let map = baselines.0.lock().unwrap();
-        map.get(&host_id).cloned()
-            .ok_or_else(|| "No baseline config found for this host".to_string())?
-    };
-    let baseline_val: Value = serde_json::from_str(&baseline)
-        .map_err(|e| format!("Failed to parse baseline: {e}"))?;
-    // Save current as snapshot before discarding
-    let current = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await
-        .unwrap_or_default();
-    remote_write_config_with_snapshot(&pool, &host_id, &current, &baseline_val, "discard-changes").await?;
-    Ok(true)
+    target_profile: Option<String>,
+    rescue_profile: Option<String>,
+) -> Result<RescuePrimaryDiagnosisResult, String> {
+    let target_profile = normalize_profile_name(target_profile.as_deref(), "primary");
+    let rescue_profile = normalize_profile_name(rescue_profile.as_deref(), "rescue");
+    diagnose_primary_via_rescue_remote(&pool, &host_id, &target_profile, &rescue_profile).await
 }
 
 #[tauri::command]
-pub async fn remote_apply_pending_changes(
+pub async fn remote_repair_primary_via_rescue(
     pool: State<'_, SshConnectionPool>,
-    baselines: State<'_, RemoteConfigBaselines>,
     host_id: String,
-) -> Result<bool, String> {
-    // Save current config as new baseline
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("Failed to parse remote config: {e}"))?;
-    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    baselines.0.lock().unwrap().insert(host_id.clone(), text);
-    // Restart gateway
-    pool.exec_login(&host_id, "openclaw gateway restart").await?;
-    Ok(true)
+    target_profile: Option<String>,
+    rescue_profile: Option<String>,
+    issue_ids: Option<Vec<String>>,
+) -> Result<RescuePrimaryRepairResult, String> {
+    let target_profile = normalize_profile_name(target_profile.as_deref(), "primary");
+    let rescue_profile = normalize_profile_name(rescue_profile.as_deref(), "rescue");
+    repair_primary_via_rescue_remote(
+        &pool,
+        &host_id,
+        &target_profile,
+        &rescue_profile,
+        issue_ids.unwrap_or_default(),
+    )
+    .await
 }
+
+async fn run_remote_rescue_bot_command(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    command: Vec<String>,
+) -> Result<RescueBotCommandResult, String> {
+    let mut remote_cmd = String::from("openclaw");
+    for arg in &command {
+        remote_cmd.push(' ');
+        remote_cmd.push_str(&shell_escape(arg));
+    }
+    let raw = pool.exec_login(host_id, &remote_cmd).await?;
+    Ok(RescueBotCommandResult {
+        command,
+        output: OpenclawCommandOutput {
+            stdout: raw.stdout,
+            stderr: raw.stderr,
+            exit_code: raw.exit_code as i32,
+        },
+    })
+}
+
+async fn run_remote_openclaw_dynamic(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    command: Vec<String>,
+) -> Result<OpenclawCommandOutput, String> {
+    Ok(run_remote_rescue_bot_command(pool, host_id, command).await?.output)
+}
+
+async fn run_remote_primary_doctor_with_fallback(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &str,
+) -> Result<OpenclawCommandOutput, String> {
+    let json_command = build_profile_command(profile, &["doctor", "--json"]);
+    let output = run_remote_openclaw_dynamic(pool, host_id, json_command).await?;
+    if output.exit_code != 0 && is_doctor_json_option_unsupported(&output) {
+        let plain_command = build_profile_command(profile, &["doctor"]);
+        return run_remote_openclaw_dynamic(pool, host_id, plain_command).await;
+    }
+    Ok(output)
+}
+
+async fn run_remote_gateway_restart_fallback(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &str,
+    commands: &mut Vec<RescueBotCommandResult>,
+) -> Result<(), String> {
+    let stop_command = vec![
+        "--profile".to_string(),
+        profile.to_string(),
+        "gateway".to_string(),
+        "stop".to_string(),
+    ];
+    let stop_result = run_remote_rescue_bot_command(pool, host_id, stop_command).await?;
+    commands.push(stop_result);
+
+    let start_command = vec![
+        "--profile".to_string(),
+        profile.to_string(),
+        "gateway".to_string(),
+        "start".to_string(),
+    ];
+    let start_result = run_remote_rescue_bot_command(pool, host_id, start_command).await?;
+    if start_result.output.exit_code != 0 {
+        return Err(command_failure_message(
+            &start_result.command,
+            &start_result.output,
+        ));
+    }
+    commands.push(start_result);
+    Ok(())
+}
+
 
 #[tauri::command]
 pub async fn remote_apply_config_patch(
@@ -4673,222 +7090,6 @@ pub async fn remote_apply_config_patch(
         warnings: Vec::new(),
         errors: Vec::new(),
     })
-}
-
-#[tauri::command]
-pub async fn remote_create_agent(
-    pool: State<'_, SshConnectionPool>,
-    host_id: String,
-    agent_id: String,
-    model: Option<String>,
-) -> Result<Value, String> {
-    let agent_id = agent_id.trim().to_string();
-    if agent_id.is_empty() {
-        return Err("Agent ID is required".into());
-    }
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let mut cfg: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse: {e}"))?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    let existing = collect_agent_ids(&cfg);
-    if existing.iter().any(|id| id.eq_ignore_ascii_case(&agent_id)) {
-        return Err(format!("Agent '{}' already exists", agent_id));
-    }
-
-    // Resolve model value from profile ID (convert UUID to "provider/model" string)
-    let model_value = if let Some(ref profile_id) = model {
-        let pid = profile_id.trim();
-        if pid.is_empty() {
-            None
-        } else {
-            // Load remote model profiles and find matching one
-            let profiles_raw = pool.sftp_read(&host_id, "~/.clawpal/model-profiles.json").await
-                .unwrap_or_else(|_| r#"{"profiles":[]}"#.to_string());
-            let profiles: Vec<ModelProfile> = serde_json::from_str::<Value>(&profiles_raw)
-                .ok()
-                .and_then(|v| v.get("profiles")?.as_array().cloned())
-                .map(|arr| arr.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
-                .unwrap_or_default();
-            profiles.iter()
-                .find(|p| p.id == pid)
-                .map(|p| profile_to_model_value(p))
-                .or_else(|| Some(pid.to_string()))
-        }
-    } else {
-        None
-    };
-
-    let mut agent_obj = serde_json::Map::new();
-    agent_obj.insert("id".into(), Value::String(agent_id.clone()));
-    if let Some(ref m) = model_value {
-        agent_obj.insert("model".into(), Value::String(m.clone()));
-    }
-
-    let agents = cfg
-        .as_object_mut()
-        .ok_or("config is not an object")?
-        .entry("agents")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or("agents is not an object")?;
-    let list = agents
-        .entry("list")
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or("agents.list is not an array")?;
-    list.push(Value::Object(agent_obj));
-
-    remote_write_config_with_snapshot(&pool, &host_id, &current_text, &cfg, "create-agent")
-        .await?;
-    Ok(serde_json::json!({
-        "id": agent_id,
-        "name": null,
-        "emoji": null,
-        "model": model_value,
-        "channels": [],
-        "online": false,
-        "workspace": null,
-    }))
-}
-
-#[tauri::command]
-pub async fn remote_delete_agent(
-    pool: State<'_, SshConnectionPool>,
-    host_id: String,
-    agent_id: String,
-) -> Result<bool, String> {
-    let agent_id = agent_id.trim().to_string();
-    if agent_id == "main" {
-        return Err("Cannot delete the main agent".into());
-    }
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let mut cfg: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse: {e}"))?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    let list = cfg
-        .pointer_mut("/agents/list")
-        .and_then(Value::as_array_mut)
-        .ok_or("agents.list not found")?;
-    let before = list.len();
-    list.retain(|a| a.get("id").and_then(Value::as_str) != Some(&agent_id));
-    if list.len() == before {
-        return Err(format!("Agent '{}' not found", agent_id));
-    }
-
-    // Also remove bindings for this agent
-    if let Some(bindings) = cfg.get_mut("bindings").and_then(Value::as_array_mut) {
-        bindings.retain(|b| b.get("agentId").and_then(Value::as_str) != Some(&agent_id));
-    }
-
-    remote_write_config_with_snapshot(&pool, &host_id, &current_text, &cfg, "delete-agent")
-        .await?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub async fn remote_assign_channel_agent(
-    pool: State<'_, SshConnectionPool>,
-    host_id: String,
-    channel_type: String,
-    peer_id: String,
-    agent_id: Option<String>,
-) -> Result<bool, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let mut cfg: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse: {e}"))?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    let agent_id = agent_id
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let bindings = cfg.get_mut("bindings").and_then(Value::as_array_mut);
-    if let Some(arr) = bindings {
-        arr.retain(|b| {
-            let m = b.get("match");
-            let ch = m.and_then(|m| m.get("channel")).and_then(Value::as_str);
-            let pid = m
-                .and_then(|m| m.pointer("/peer/id"))
-                .and_then(Value::as_str);
-            !(ch == Some(&channel_type) && pid == Some(&peer_id))
-        });
-        if let Some(ref aid) = agent_id {
-            arr.push(serde_json::json!({
-                "agentId": aid,
-                "match": {
-                    "channel": channel_type,
-                    "peer": { "id": peer_id, "kind": "channel" }
-                }
-            }));
-        }
-    } else if let Some(ref aid) = agent_id {
-        cfg.as_object_mut().unwrap().insert(
-            "bindings".into(),
-            serde_json::json!([
-                {
-                    "agentId": aid,
-                    "match": {
-                        "channel": channel_type,
-                        "peer": { "id": peer_id, "kind": "channel" }
-                    }
-                }
-            ]),
-        );
-    }
-
-    remote_write_config_with_snapshot(
-        &pool,
-        &host_id,
-        &current_text,
-        &cfg,
-        "assign-channel-agent",
-    )
-    .await?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub async fn remote_set_global_model(
-    pool: State<'_, SshConnectionPool>,
-    host_id: String,
-    model_value: Option<String>,
-) -> Result<bool, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let mut cfg: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse: {e}"))?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    set_nested_value(
-        &mut cfg,
-        "agents.defaults.model",
-        model_value.map(Value::String),
-    )?;
-    remote_write_config_with_snapshot(&pool, &host_id, &current_text, &cfg, "set-global-model")
-        .await?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub async fn remote_set_agent_model(
-    pool: State<'_, SshConnectionPool>,
-    host_id: String,
-    agent_id: String,
-    model_value: Option<String>,
-) -> Result<bool, String> {
-    if agent_id.trim().is_empty() {
-        return Err("agent id is required".into());
-    }
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let mut cfg: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse: {e}"))?;
-    let current_text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-
-    set_agent_model_value(&mut cfg, &agent_id, model_value)?;
-    remote_write_config_with_snapshot(&pool, &host_id, &current_text, &cfg, "set-agent-model")
-        .await?;
-    Ok(true)
 }
 
 #[tauri::command]
@@ -4928,19 +7129,24 @@ pub async fn remote_list_history(
         if entry.name.starts_with('.') || entry.is_dir {
             continue;
         }
-        // Parse filename: {timestamp}-{source}.json
+        // Parse filename: {unix_ts}-{source}-{summary}.json
         let stem = entry.name.trim_end_matches(".json");
-        let (ts_str, source) = stem.split_once('-').unwrap_or((stem, "unknown"));
+        let parts: Vec<&str> = stem.splitn(3, '-').collect();
+        let ts_str = parts.first().unwrap_or(&"0");
+        let source = parts.get(1).unwrap_or(&"unknown");
+        let recipe_id = parts.get(2).map(|s| s.to_string());
         let created_at = ts_str.parse::<i64>().unwrap_or(0);
         // Convert Unix timestamp to ISO 8601 format for frontend compatibility
         let created_at_iso = chrono::DateTime::from_timestamp(created_at, 0)
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
             .unwrap_or_else(|| created_at.to_string());
+        let is_rollback = *source == "rollback";
         items.push(serde_json::json!({
             "id": entry.name,
+            "recipeId": recipe_id,
             "createdAt": created_at_iso,
             "source": source,
-            "canRollback": true,
+            "canRollback": !is_rollback,
         }));
     }
     // Sort newest first
@@ -5011,52 +7217,204 @@ pub async fn remote_list_discord_guild_channels(
     pool: State<'_, SshConnectionPool>,
     host_id: String,
 ) -> Result<Vec<DiscordGuildChannel>, String> {
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))?;
-
-    // Extract bot token for Discord API calls
-    let bot_token = cfg
-        .pointer("/channels/discord/botToken")
-        .or_else(|| cfg.pointer("/channels/discord/token"))
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
-
-    let guilds = cfg
-        .get("channels")
-        .and_then(|c| c.get("discord"))
-        .and_then(|d| d.get("guilds"))
-        .and_then(Value::as_object);
-
-    let Some(guilds) = guilds else {
-        return Ok(Vec::new());
+    let output = crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["config", "get", "channels.discord", "--json"]).await?;
+    let discord_section = if output.exit_code == 0 {
+        crate::cli_runner::parse_json_output(&output).unwrap_or(Value::Null)
+    } else {
+        Value::Null
     };
+    let bindings_output = crate::cli_runner::run_openclaw_remote(&pool, &host_id, &["config", "get", "bindings", "--json"]).await?;
+    let bindings_section = if bindings_output.exit_code == 0 {
+        crate::cli_runner::parse_json_output(&bindings_output).unwrap_or_else(|_| Value::Array(Vec::new()))
+    } else {
+        Value::Array(Vec::new())
+    };
+    // Wrap to match existing code expectations (rest of function uses cfg.get("channels").and_then(|c| c.get("discord")))
+    let cfg = serde_json::json!({
+        "channels": { "discord": discord_section },
+        "bindings": bindings_section
+    });
+
+    let discord_cfg = cfg
+        .get("channels")
+        .and_then(|c| c.get("discord"));
+    let configured_single_guild_id = discord_cfg
+        .and_then(|d| d.get("guilds"))
+        .and_then(Value::as_object)
+        .and_then(|guilds| {
+            if guilds.len() == 1 {
+                guilds.keys().next().cloned()
+            } else {
+                None
+            }
+        });
+
+    // Extract bot token: top-level first, then fall back to first account token
+    let bot_token = discord_cfg
+        .and_then(|d| d.get("botToken").or_else(|| d.get("token")))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| {
+            discord_cfg
+                .and_then(|d| d.get("accounts"))
+                .and_then(Value::as_object)
+                .and_then(|accounts| {
+                    accounts.values().find_map(|acct| {
+                        acct.get("token").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|s| s.to_string())
+                    })
+                })
+        });
 
     let mut entries: Vec<DiscordGuildChannel> = Vec::new();
     let mut channel_ids: Vec<String> = Vec::new();
     let mut unresolved_guild_ids: Vec<String> = Vec::new();
 
-    for (guild_id, guild_val) in guilds {
-        let guild_name = guild_val
-            .get("slug")
-            .or_else(|| guild_val.get("name"))
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| guild_id.clone());
+    // Helper: collect guilds from a guilds object
+    let collect_guilds = |guilds: &serde_json::Map<String, Value>,
+                               entries: &mut Vec<DiscordGuildChannel>,
+                               channel_ids: &mut Vec<String>,
+                               unresolved_guild_ids: &mut Vec<String>| {
+        for (guild_id, guild_val) in guilds {
+            let guild_name = guild_val
+                .get("slug")
+                .or_else(|| guild_val.get("name"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| guild_id.clone());
 
-        if guild_name == *guild_id {
-            unresolved_guild_ids.push(guild_id.clone());
+            if guild_name == *guild_id && !unresolved_guild_ids.contains(guild_id) {
+                unresolved_guild_ids.push(guild_id.clone());
+            }
+
+            if let Some(channels) = guild_val.get("channels").and_then(Value::as_object) {
+                for (channel_id, _) in channels {
+                    // Skip glob/wildcard patterns (e.g. "*") — not real channel IDs
+                    if channel_id.contains('*') || channel_id.contains('?') {
+                        continue;
+                    }
+                    if entries.iter().any(|e| e.guild_id == *guild_id && e.channel_id == *channel_id) {
+                        continue;
+                    }
+                    channel_ids.push(channel_id.clone());
+                    entries.push(DiscordGuildChannel {
+                        guild_id: guild_id.clone(),
+                        guild_name: guild_name.clone(),
+                        channel_id: channel_id.clone(),
+                        channel_name: channel_id.clone(),
+                    });
+                }
+            }
         }
+    };
 
-        if let Some(channels) = guild_val.get("channels").and_then(Value::as_object) {
-            for (channel_id, _) in channels {
-                channel_ids.push(channel_id.clone());
-                entries.push(DiscordGuildChannel {
-                    guild_id: guild_id.clone(),
-                    guild_name: guild_name.clone(),
-                    channel_id: channel_id.clone(),
-                    channel_name: channel_id.clone(),
-                });
+    // Collect from channels.discord.guilds (top-level structured config)
+    if let Some(guilds) = discord_cfg.and_then(|d| d.get("guilds")).and_then(Value::as_object) {
+        collect_guilds(guilds, &mut entries, &mut channel_ids, &mut unresolved_guild_ids);
+    }
+
+    // Collect from channels.discord.accounts.<accountId>.guilds (multi-account config)
+    if let Some(accounts) = discord_cfg.and_then(|d| d.get("accounts")).and_then(Value::as_object) {
+        for (_account_id, account_val) in accounts {
+            if let Some(guilds) = account_val.get("guilds").and_then(Value::as_object) {
+                collect_guilds(guilds, &mut entries, &mut channel_ids, &mut unresolved_guild_ids);
+            }
+        }
+    }
+
+    // Also collect from bindings array (users may only have bindings, no guilds map)
+    if let Some(bindings) = cfg.get("bindings").and_then(Value::as_array) {
+        for b in bindings {
+            let m = match b.get("match") {
+                Some(m) => m,
+                None => continue,
+            };
+            if m.get("channel").and_then(Value::as_str) != Some("discord") {
+                continue;
+            }
+            let guild_id = match m.get("guildId") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => continue,
+            };
+            let channel_id = match m.pointer("/peer/id") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => continue,
+            };
+            if entries.iter().any(|e| e.guild_id == guild_id && e.channel_id == channel_id) {
+                continue;
+            }
+            if !unresolved_guild_ids.contains(&guild_id) {
+                unresolved_guild_ids.push(guild_id.clone());
+            }
+            channel_ids.push(channel_id.clone());
+            entries.push(DiscordGuildChannel {
+                guild_id: guild_id.clone(),
+                guild_name: guild_id.clone(),
+                channel_id: channel_id.clone(),
+                channel_name: channel_id.clone(),
+            });
+        }
+    }
+
+    // Fallback A: if we have token + guild ids, fetch channels from Discord REST directly.
+    // This avoids hard-failing when CLI rejects config due non-critical schema drift.
+    if channel_ids.is_empty() {
+        let configured_guild_ids = collect_discord_config_guild_ids(discord_cfg);
+        if let Some(token) = bot_token.clone() {
+            let rest_entries = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<DiscordGuildChannel> = Vec::new();
+                for guild_id in configured_guild_ids {
+                    if let Ok(channels) = fetch_discord_guild_channels(&token, &guild_id) {
+                        for (channel_id, channel_name) in channels {
+                            if out.iter().any(|e| e.guild_id == guild_id && e.channel_id == channel_id) {
+                                continue;
+                            }
+                            out.push(DiscordGuildChannel {
+                                guild_id: guild_id.clone(),
+                                guild_name: guild_id.clone(),
+                                channel_id,
+                                channel_name,
+                            });
+                        }
+                    }
+                }
+                out
+            }).await.unwrap_or_default();
+            for entry in rest_entries {
+                if entries.iter().any(|e| e.guild_id == entry.guild_id && e.channel_id == entry.channel_id) {
+                    continue;
+                }
+                channel_ids.push(entry.channel_id.clone());
+                entries.push(entry);
+            }
+        }
+    }
+
+    // Fallback B: query channel ids from directory and keep compatibility
+    // with existing cache shape when config has no explicit channel map.
+    if channel_ids.is_empty() {
+        let cmd = "openclaw directory groups list --channel discord --json";
+        if let Ok(r) = pool.exec_login(&host_id, cmd).await {
+            if r.exit_code == 0 && !r.stdout.trim().is_empty() {
+                for channel_id in parse_directory_group_channel_ids(&r.stdout) {
+                    if entries.iter().any(|e| e.channel_id == channel_id) {
+                        continue;
+                    }
+                    let (guild_id, guild_name) = if let Some(gid) = configured_single_guild_id.clone() {
+                        (gid.clone(), gid)
+                    } else {
+                        ("discord".to_string(), "Discord".to_string())
+                    };
+                    channel_ids.push(channel_id.clone());
+                    entries.push(DiscordGuildChannel {
+                        guild_id,
+                        guild_name,
+                        channel_id: channel_id.clone(),
+                        channel_name: channel_id,
+                    });
+                }
             }
         }
     }
@@ -5099,6 +7457,12 @@ pub async fn remote_list_discord_guild_channels(
         }
     }
 
+    // Persist to remote cache
+    if !entries.is_empty() {
+        let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+        let _ = pool.sftp_write(&host_id, "~/.clawpal/discord-guild-channels.json", &json).await;
+    }
+
     Ok(entries)
 }
 
@@ -5128,6 +7492,7 @@ pub async fn remote_analyze_sessions(
     // Run a shell script via SSH that scans session files and outputs JSON.
     // This is MUCH faster than doing per-file SFTP reads.
     let script = r#"
+setopt nonomatch 2>/dev/null; shopt -s nullglob 2>/dev/null
 cd ~/.openclaw/agents 2>/dev/null || { echo '[]'; exit 0; }
 now=$(date +%s)
 sep=""
@@ -5287,6 +7652,7 @@ pub async fn remote_list_session_files(
     host_id: String,
 ) -> Result<Vec<SessionFile>, String> {
     let script = r#"
+setopt nonomatch 2>/dev/null; shopt -s nullglob 2>/dev/null
 cd ~/.openclaw/agents 2>/dev/null || { echo "[]"; exit 0; }
 sep=""
 echo "["
@@ -5335,6 +7701,7 @@ pub async fn remote_clear_all_sessions(
     host_id: String,
 ) -> Result<usize, String> {
     let script = r#"
+setopt nonomatch 2>/dev/null; shopt -s nullglob 2>/dev/null
 count=0
 cd ~/.openclaw/agents 2>/dev/null || { echo "0"; exit 0; }
 for agent_dir in */; do
@@ -5521,14 +7888,18 @@ pub async fn remote_resolve_api_keys(
     pool: State<'_, SshConnectionPool>,
     host_id: String,
 ) -> Result<Vec<ResolvedApiKey>, String> {
-    let content = pool.sftp_read(&host_id, "~/.clawpal/model-profiles.json").await
-        .unwrap_or_else(|_| r#"{"profiles":[]}"#.to_string());
+    let content = match pool.sftp_read(&host_id, "~/.clawpal/model-profiles.json").await {
+        Ok(content) => content,
+        Err(e) if is_remote_missing_path_error(&e) => r#"{"profiles":[]}"#.to_string(),
+        Err(e) => return Err(format!("Failed to read remote model profiles: {e}")),
+    };
     #[derive(serde::Deserialize)]
     struct Storage {
         #[serde(default)]
         profiles: Vec<ModelProfile>,
     }
-    let storage: Storage = serde_json::from_str(&content).unwrap_or(Storage { profiles: Vec::new() });
+    let storage: Storage = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse remote model profiles: {e}"))?;
     let mut out = Vec::new();
     for profile in &storage.profiles {
         let masked = if let Some(ref key) = profile.api_key {
@@ -5552,6 +7923,200 @@ pub async fn remote_resolve_api_keys(
         });
     }
     Ok(out)
+}
+
+fn is_remote_missing_path_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("no such file")
+        || lower.contains("no such file or directory")
+        || lower.contains("not found")
+        || lower.contains("cannot open")
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+async fn read_remote_env_var(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    if !is_valid_env_var_name(name) {
+        return Err(format!("Invalid environment variable name: {name}"));
+    }
+
+    let cmd = format!("printenv -- {name}");
+    let out = pool
+        .exec_login(host_id, &cmd)
+        .await
+        .map_err(|e| format!("Failed to read remote env var {name}: {e}"))?;
+
+    if out.exit_code != 0 {
+        return Ok(None);
+    }
+
+    let value = out.stdout.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+async fn resolve_remote_key_from_agent_auth_profiles(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    auth_ref: &str,
+) -> Result<Option<String>, String> {
+    let entries = pool
+        .sftp_list(host_id, "~/.openclaw/agents")
+        .await
+        .map_err(|e| format!("Failed to list remote agents directory: {e}"))?;
+
+    for agent in entries.into_iter().filter(|entry| entry.is_dir) {
+        let auth_file = format!("~/.openclaw/agents/{}/agent/auth-profiles.json", agent.name);
+        let text = match pool.sftp_read(host_id, &auth_file).await {
+            Ok(text) => text,
+            Err(e) if is_remote_missing_path_error(&e) => continue,
+            Err(e) => return Err(format!("Failed to read remote auth profiles at {auth_file}: {e}")),
+        };
+        let data: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse remote auth profiles at {auth_file}: {e}"))?;
+        if let Some(profiles) = data.get("profiles").and_then(Value::as_object) {
+            if let Some(auth_entry) = profiles.get(auth_ref) {
+                if let Some(key) = extract_token_from_auth_entry(auth_entry) {
+                    return Ok(Some(key));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn resolve_remote_profile_base_url(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &ModelProfile,
+) -> Result<Option<String>, String> {
+    if let Some(base) = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(Some(base.to_string()));
+    }
+
+    let raw = match pool.sftp_read(host_id, "~/.openclaw/openclaw.json").await {
+        Ok(raw) => raw,
+        Err(e) if is_remote_missing_path_error(&e) => return Ok(None),
+        Err(e) => return Err(format!("Failed to read remote config for base URL resolution: {e}")),
+    };
+    let cfg: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse remote config for base URL resolution: {e}"))?;
+    Ok(resolve_model_provider_base_url(&cfg, &profile.provider))
+}
+
+async fn resolve_remote_profile_api_key(
+    pool: &SshConnectionPool,
+    host_id: &str,
+    profile: &ModelProfile,
+) -> Result<String, String> {
+    if let Some(key) = &profile.api_key {
+        let trimmed_key = key.trim();
+        if !trimmed_key.is_empty() {
+            return Ok(trimmed_key.to_string());
+        }
+    }
+
+    let auth_ref = profile.auth_ref.trim();
+    if !auth_ref.is_empty() {
+        // Try auth_ref as remote env var name directly (e.g. OPENAI_API_KEY)
+        if auth_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            if let Some(key) = read_remote_env_var(pool, host_id, auth_ref).await? {
+                return Ok(key);
+            }
+        }
+
+        // Try auth_ref from remote agent auth-profiles.json
+        if let Some(key) = resolve_remote_key_from_agent_auth_profiles(pool, host_id, auth_ref).await? {
+            return Ok(key);
+        }
+    }
+
+    // Try provider-based env conventions as fallback
+    let provider = profile.provider.trim().to_uppercase().replace('-', "_");
+    if !provider.is_empty() {
+        for suffix in ["_API_KEY", "_KEY", "_TOKEN"] {
+            let env_name = format!("{provider}{suffix}");
+            if let Some(key) = read_remote_env_var(pool, host_id, &env_name).await? {
+                return Ok(key);
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
+#[tauri::command]
+pub async fn remote_test_model_profile(
+    pool: State<'_, SshConnectionPool>,
+    host_id: String,
+    profile_id: String,
+) -> Result<bool, String> {
+    let content = match pool
+        .sftp_read(&host_id, "~/.clawpal/model-profiles.json")
+        .await
+    {
+        Ok(content) => content,
+        Err(e) if is_remote_missing_path_error(&e) => r#"{"profiles":[]}"#.to_string(),
+        Err(e) => return Err(format!("Failed to read remote model profiles: {e}")),
+    };
+    #[derive(serde::Deserialize)]
+    struct Storage {
+        #[serde(default)]
+        profiles: Vec<ModelProfile>,
+    }
+    let storage: Storage = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse remote model profiles: {e}"))?;
+    let profile = storage
+        .profiles
+        .into_iter()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| format!("Profile not found: {profile_id}"))?;
+
+    if !profile.enabled {
+        return Err("Profile is disabled".into());
+    }
+
+    let api_key = resolve_remote_profile_api_key(&pool, &host_id, &profile).await?;
+    if api_key.trim().is_empty() {
+        return Err(
+            "No API key resolved for this remote profile. Set apiKey directly, configure auth_ref in remote auth-profiles.json, or export auth_ref on remote shell.".into(),
+        );
+    }
+
+    let resolved_base_url = resolve_remote_profile_base_url(&pool, &host_id, &profile).await?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        run_provider_probe(profile.provider, profile.model, resolved_base_url, api_key)
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {e}"))??;
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -5646,19 +8211,40 @@ pub async fn remote_refresh_model_catalog(
     pool: State<'_, SshConnectionPool>,
     host_id: String,
 ) -> Result<Vec<ModelCatalogProvider>, String> {
+    let paths = resolve_paths();
+    let cache_path = remote_model_catalog_cache_path(&paths, &host_id);
+    let remote_version = match pool.exec_login(&host_id, "openclaw --version").await {
+        Ok(r) => extract_version_from_text(&r.stdout)
+            .unwrap_or_else(|| r.stdout.trim().to_string()),
+        Err(_) => "unknown".into(),
+    };
+    let cached = read_model_catalog_cache(&cache_path);
+    if let Some(selected) = select_catalog_from_cache(cached.as_ref(), &remote_version) {
+        return Ok(selected);
+    }
+
     let result = pool.exec_login(&host_id, "openclaw models list --all --json --no-color").await;
     if let Ok(r) = result {
         if r.exit_code == 0 && !r.stdout.trim().is_empty() {
             if let Some(catalog) = parse_model_catalog_from_cli_output(&r.stdout) {
+                let cache = ModelCatalogProviderCache {
+                    cli_version: remote_version,
+                    updated_at: unix_timestamp_secs(),
+                    providers: catalog.clone(),
+                    source: "openclaw models list --all --json".into(),
+                    error: None,
+                };
+                let _ = save_model_catalog_cache(&cache_path, &cache);
                 return Ok(catalog);
             }
         }
     }
-
-    // Fallback: extract from remote config
-    let raw = pool.sftp_read(&host_id, "~/.openclaw/openclaw.json").await?;
-    let cfg: Value = serde_json::from_str(&raw).map_err(|e| format!("Failed to parse remote config: {e}"))?;
-    Ok(collect_model_catalog(&cfg))
+    if let Some(previous) = cached {
+        if !previous.providers.is_empty() && previous.error.is_none() {
+            return Ok(previous.providers);
+        }
+    }
+    Err("Failed to load remote model catalog from openclaw CLI".into())
 }
 
 #[tauri::command]
@@ -5675,6 +8261,7 @@ pub async fn run_openclaw_upgrade() -> Result<String, String> {
         format!("{stdout}\n{stderr}")
     };
     if output.status.success() {
+        clear_openclaw_version_cache();
         Ok(combined)
     } else {
         Err(combined)
@@ -5686,20 +8273,540 @@ pub async fn remote_run_openclaw_upgrade(
     pool: State<'_, SshConnectionPool>,
     host_id: String,
 ) -> Result<String, String> {
-    let result = pool
-        .exec_login(
-            &host_id,
-            "curl -fsSL https://openclaw.ai/install.sh | bash",
-        )
-        .await?;
+    // Use the official install script with --no-prompt for non-interactive SSH.
+    // The script handles npm prefix/permissions, bin links, and PATH fixups
+    // that plain `npm install -g` misses (e.g. stale /usr/bin/openclaw symlinks).
+    let version_before = pool.exec_login(&host_id, "openclaw --version 2>/dev/null || true").await
+        .map(|r| r.stdout.trim().to_string()).unwrap_or_default();
+
+    let install_cmd = "curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-prompt --no-onboard 2>&1";
+    let result = pool.exec_login(&host_id, install_cmd).await?;
     let combined = if result.stderr.is_empty() {
         result.stdout.clone()
     } else {
         format!("{}\n{}", result.stdout, result.stderr)
     };
-    if result.exit_code == 0 {
-        Ok(combined)
-    } else {
-        Err(combined)
+
+    if result.exit_code != 0 {
+        return Err(combined);
     }
+
+    // Restart gateway after successful upgrade (best-effort)
+    let _ = pool.exec_login(&host_id, "openclaw gateway restart 2>/dev/null || true").await;
+
+    // Verify version actually changed
+    let version_after = pool.exec_login(&host_id, "openclaw --version 2>/dev/null || true").await
+        .map(|r| r.stdout.trim().to_string()).unwrap_or_default();
+    if !version_before.is_empty() && !version_after.is_empty() && version_before == version_after {
+        return Err(format!("{combined}\n\nWarning: version unchanged after upgrade ({version_before}). Check PATH or npm prefix."));
+    }
+
+    Ok(combined)
+}
+
+// ---------------------------------------------------------------------------
+// Cron jobs
+// ---------------------------------------------------------------------------
+
+/// Strip Doctor warning banners from CLI output to show only meaningful errors.
+/// Doctor banners look like: ╭─ ... ─╮ ... ╰─ ... ─╯
+fn strip_doctor_banner(text: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut in_banner = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("Doctor warnings") && trimmed.contains('╮') {
+            in_banner = true;
+            continue;
+        }
+        if in_banner {
+            if trimmed.contains('╯') {
+                in_banner = false;
+            }
+            continue;
+        }
+        if !trimmed.is_empty() {
+            lines.push(line);
+        }
+    }
+    let result = lines.join("\n").trim().to_string();
+    if result.is_empty() { "Command failed".into() } else { result }
+}
+
+fn parse_cron_jobs(text: &str) -> Value {
+    let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Array(vec![]));
+    // Handle { "version": N, "jobs": [...] } wrapper
+    let jobs = if let Some(arr) = parsed.pointer("/jobs") {
+        arr.clone()
+    } else {
+        parsed
+    };
+    match jobs {
+        Value::Array(arr) => {
+            let mapped: Vec<Value> = arr.into_iter().map(|mut v| {
+                // Map "id" → "jobId" for frontend compatibility
+                if let Value::Object(ref mut obj) = v {
+                    if let Some(id) = obj.get("id").cloned() {
+                        obj.entry("jobId".to_string()).or_insert(id);
+                    }
+                }
+                v
+            }).collect();
+            Value::Array(mapped)
+        }
+        Value::Object(map) => {
+            let arr: Vec<Value> = map.into_iter().map(|(k, mut v)| {
+                if let Value::Object(ref mut obj) = v {
+                    obj.entry("jobId".to_string()).or_insert(Value::String(k.clone()));
+                    obj.entry("id".to_string()).or_insert(Value::String(k));
+                }
+                v
+            }).collect();
+            Value::Array(arr)
+        }
+        _ => Value::Array(vec![]),
+    }
+}
+
+#[tauri::command]
+pub fn list_cron_jobs() -> Result<Value, String> {
+    let paths = resolve_paths();
+    let jobs_path = paths.base_dir.join("cron").join("jobs.json");
+    if !jobs_path.exists() {
+        return Ok(Value::Array(vec![]));
+    }
+    let text = std::fs::read_to_string(&jobs_path).map_err(|e| e.to_string())?;
+    Ok(parse_cron_jobs(&text))
+}
+
+#[tauri::command]
+pub fn get_cron_runs(job_id: String, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let paths = resolve_paths();
+    let runs_path = paths.base_dir.join("cron").join("runs").join(format!("{}.jsonl", job_id));
+    if !runs_path.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&runs_path).map_err(|e| e.to_string())?;
+    let mut runs: Vec<Value> = text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    runs.reverse();
+    let limit = limit.unwrap_or(10);
+    runs.truncate(limit);
+    Ok(runs)
+}
+
+#[tauri::command]
+pub async fn trigger_cron_job(job_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = std::process::Command::new(resolve_openclaw_bin())
+            .args(["cron", "run", &job_id])
+            .output()
+            .map_err(|e| format!("Failed to run openclaw: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if output.status.success() {
+            Ok(stdout)
+        } else {
+            // Extract meaningful error lines, skip Doctor warning banners
+            let error_msg = strip_doctor_banner(&format!("{stdout}\n{stderr}"));
+            Err(error_msg)
+        }
+    }).await.map_err(|e| format!("Task failed: {e}"))?
+}
+
+#[tauri::command]
+pub fn delete_cron_job(job_id: String) -> Result<String, String> {
+    let output = std::process::Command::new(resolve_openclaw_bin())
+        .args(["cron", "remove", &job_id])
+        .output()
+        .map_err(|e| format!("Failed to run openclaw: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("{stdout}\n{stderr}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote cron jobs
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn remote_list_cron_jobs(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Value, String> {
+    let raw = pool.sftp_read(&host_id, "~/.openclaw/cron/jobs.json").await;
+    match raw {
+        Ok(text) => Ok(parse_cron_jobs(&text)),
+        Err(_) => Ok(Value::Array(vec![])),
+    }
+}
+
+#[tauri::command]
+pub async fn remote_get_cron_runs(pool: State<'_, SshConnectionPool>, host_id: String, job_id: String, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let path = format!("~/.openclaw/cron/runs/{}.jsonl", job_id);
+    let raw = pool.sftp_read(&host_id, &path).await;
+    match raw {
+        Ok(text) => {
+            let mut runs: Vec<Value> = text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            runs.reverse();
+            let limit = limit.unwrap_or(10);
+            runs.truncate(limit);
+            Ok(runs)
+        }
+        Err(_) => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+pub async fn remote_trigger_cron_job(pool: State<'_, SshConnectionPool>, host_id: String, job_id: String) -> Result<String, String> {
+    let result = pool.exec_login(&host_id, &format!("openclaw cron run {}", shell_escape(&job_id))).await?;
+    if result.exit_code == 0 {
+        Ok(result.stdout)
+    } else {
+        Err(format!("{}\n{}", result.stdout, result.stderr))
+    }
+}
+
+#[tauri::command]
+pub async fn remote_delete_cron_job(pool: State<'_, SshConnectionPool>, host_id: String, job_id: String) -> Result<String, String> {
+    let result = pool.exec_login(&host_id, &format!("openclaw cron remove {}", shell_escape(&job_id))).await?;
+    if result.exit_code == 0 {
+        Ok(result.stdout)
+    } else {
+        Err(format!("{}\n{}", result.stdout, result.stderr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog management
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_watchdog_status() -> Result<Value, String> {
+    let paths = resolve_paths();
+    let wd_dir = paths.clawpal_dir.join("watchdog");
+    let status_path = wd_dir.join("status.json");
+    let pid_path = wd_dir.join("watchdog.pid");
+
+    let mut status = if status_path.exists() {
+        let text = std::fs::read_to_string(&status_path).map_err(|e| e.to_string())?;
+        serde_json::from_str::<Value>(&text).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    let alive = if pid_path.exists() {
+        let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if let Value::Object(ref mut map) = status {
+        map.insert("alive".into(), Value::Bool(alive));
+        map.insert("deployed".into(), Value::Bool(wd_dir.join("watchdog.js").exists()));
+    } else {
+        let mut map = serde_json::Map::new();
+        map.insert("alive".into(), Value::Bool(alive));
+        map.insert("deployed".into(), Value::Bool(wd_dir.join("watchdog.js").exists()));
+        status = Value::Object(map);
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn deploy_watchdog(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let paths = resolve_paths();
+    let wd_dir = paths.clawpal_dir.join("watchdog");
+    std::fs::create_dir_all(&wd_dir).map_err(|e| e.to_string())?;
+
+    let resource_path = app_handle.path()
+        .resolve("resources/watchdog.js", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve watchdog resource: {e}"))?;
+
+    let content = std::fs::read_to_string(&resource_path)
+        .map_err(|e| format!("Failed to read watchdog resource: {e}"))?;
+
+    std::fs::write(wd_dir.join("watchdog.js"), content).map_err(|e| e.to_string())?;
+    crate::logging::log_info("Watchdog deployed");
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn start_watchdog() -> Result<bool, String> {
+    let paths = resolve_paths();
+    let wd_dir = paths.clawpal_dir.join("watchdog");
+    let script = wd_dir.join("watchdog.js");
+    let pid_path = wd_dir.join("watchdog.pid");
+    let log_path = wd_dir.join("watchdog.log");
+
+    if !script.exists() {
+        return Err("Watchdog not deployed. Deploy first.".into());
+    }
+
+    if pid_path.exists() {
+        let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if alive {
+                return Ok(true);
+            }
+        }
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&log_path)
+        .map_err(|e| e.to_string())?;
+    let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
+
+    let _child = std::process::Command::new("node")
+        .arg(&script)
+        .current_dir(&wd_dir)
+        .env("CLAWPAL_WATCHDOG_DIR", &wd_dir)
+        .stdout(log_file)
+        .stderr(log_err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start watchdog: {e}"))?;
+
+    // PID file is written by watchdog.js itself via acquirePidFile()
+    crate::logging::log_info("Watchdog started");
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn stop_watchdog() -> Result<bool, String> {
+    let paths = resolve_paths();
+    let pid_path = paths.clawpal_dir.join("watchdog").join("watchdog.pid");
+
+    if !pid_path.exists() {
+        return Ok(true);
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
+    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+    }
+
+    let _ = std::fs::remove_file(&pid_path);
+    crate::logging::log_info("Watchdog stopped");
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn uninstall_watchdog() -> Result<bool, String> {
+    let paths = resolve_paths();
+    let wd_dir = paths.clawpal_dir.join("watchdog");
+
+    // Stop first if running
+    let pid_path = wd_dir.join("watchdog.pid");
+    if pid_path.exists() {
+        let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
+        }
+    }
+
+    // Remove entire watchdog directory
+    if wd_dir.exists() {
+        std::fs::remove_dir_all(&wd_dir).map_err(|e| e.to_string())?;
+    }
+    crate::logging::log_info("Watchdog uninstalled");
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Log reading commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn read_app_log(lines: Option<usize>) -> Result<String, String> {
+    crate::logging::read_log_tail("app.log", lines.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn read_error_log(lines: Option<usize>) -> Result<String, String> {
+    crate::logging::read_log_tail("error.log", lines.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn log_app_event(message: String) -> Result<bool, String> {
+    let trimmed = message.trim();
+    if !trimmed.is_empty() {
+        crate::logging::log_info(trimmed);
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn read_gateway_log(lines: Option<usize>) -> Result<String, String> {
+    let paths = crate::models::resolve_paths();
+    let path = paths.openclaw_dir.join("logs/gateway.log");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let all_lines: Vec<&str> = content.lines().collect();
+    let n = lines.unwrap_or(200);
+    let start = all_lines.len().saturating_sub(n);
+    Ok(all_lines[start..].join("\n"))
+}
+
+#[tauri::command]
+pub fn read_gateway_error_log(lines: Option<usize>) -> Result<String, String> {
+    let paths = crate::models::resolve_paths();
+    let path = paths.openclaw_dir.join("logs/gateway.err.log");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let all_lines: Vec<&str> = content.lines().collect();
+    let n = lines.unwrap_or(200);
+    let start = all_lines.len().saturating_sub(n);
+    Ok(all_lines[start..].join("\n"))
+}
+
+#[tauri::command]
+pub async fn remote_read_app_log(pool: State<'_, SshConnectionPool>, host_id: String, lines: Option<usize>) -> Result<String, String> {
+    let n = lines.unwrap_or(200);
+    let cmd = format!("tail -n {n} ~/.clawpal/logs/app.log 2>/dev/null || echo ''");
+    let result = pool.exec(&host_id, &cmd).await?;
+    Ok(result.stdout)
+}
+
+#[tauri::command]
+pub async fn remote_read_error_log(pool: State<'_, SshConnectionPool>, host_id: String, lines: Option<usize>) -> Result<String, String> {
+    let n = lines.unwrap_or(200);
+    let cmd = format!("tail -n {n} ~/.clawpal/logs/error.log 2>/dev/null || echo ''");
+    let result = pool.exec(&host_id, &cmd).await?;
+    Ok(result.stdout)
+}
+
+#[tauri::command]
+pub async fn remote_read_gateway_log(pool: State<'_, SshConnectionPool>, host_id: String, lines: Option<usize>) -> Result<String, String> {
+    let n = lines.unwrap_or(200);
+    let cmd = format!("tail -n {n} ~/.openclaw/logs/gateway.log 2>/dev/null || echo ''");
+    let result = pool.exec(&host_id, &cmd).await?;
+    Ok(result.stdout)
+}
+
+#[tauri::command]
+pub async fn remote_read_gateway_error_log(pool: State<'_, SshConnectionPool>, host_id: String, lines: Option<usize>) -> Result<String, String> {
+    let n = lines.unwrap_or(200);
+    let cmd = format!("tail -n {n} ~/.openclaw/logs/gateway.err.log 2>/dev/null || echo ''");
+    let result = pool.exec(&host_id, &cmd).await?;
+    Ok(result.stdout)
+}
+
+// ---------------------------------------------------------------------------
+// Remote watchdog management
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn remote_get_watchdog_status(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<Value, String> {
+    let status_raw = pool.sftp_read(&host_id, "~/.clawpal/watchdog/status.json").await;
+    let mut status = match status_raw {
+        Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+
+    let pid_raw = pool.sftp_read(&host_id, "~/.clawpal/watchdog/watchdog.pid").await;
+    let alive = match pid_raw {
+        Ok(pid_str) => {
+            let cmd = format!("kill -0 {} 2>/dev/null && echo alive || echo dead", pid_str.trim());
+            pool.exec(&host_id, &cmd).await
+                .map(|r| r.stdout.trim() == "alive")
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    };
+
+    let deployed = pool.sftp_read(&host_id, "~/.clawpal/watchdog/watchdog.js").await.is_ok();
+
+    if let Value::Object(ref mut map) = status {
+        map.insert("alive".into(), Value::Bool(alive));
+        map.insert("deployed".into(), Value::Bool(deployed));
+    } else {
+        let mut map = serde_json::Map::new();
+        map.insert("alive".into(), Value::Bool(alive));
+        map.insert("deployed".into(), Value::Bool(deployed));
+        status = Value::Object(map);
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn remote_deploy_watchdog(app_handle: tauri::AppHandle, pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    let resource_path = app_handle.path()
+        .resolve("resources/watchdog.js", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve watchdog resource: {e}"))?;
+    let content = std::fs::read_to_string(&resource_path)
+        .map_err(|e| format!("Failed to read watchdog resource: {e}"))?;
+
+    pool.exec(&host_id, "mkdir -p ~/.clawpal/watchdog").await?;
+    pool.sftp_write(&host_id, "~/.clawpal/watchdog/watchdog.js", &content).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn remote_start_watchdog(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    let pid_raw = pool.sftp_read(&host_id, "~/.clawpal/watchdog/watchdog.pid").await;
+    if let Ok(pid_str) = pid_raw {
+        let cmd = format!("kill -0 {} 2>/dev/null && echo alive || echo dead", pid_str.trim());
+        if let Ok(r) = pool.exec(&host_id, &cmd).await {
+            if r.stdout.trim() == "alive" {
+                return Ok(true);
+            }
+        }
+    }
+
+    let cmd = "cd ~/.clawpal/watchdog && nohup node watchdog.js >> watchdog.log 2>&1 &";
+    pool.exec(&host_id, cmd).await?;
+    // watchdog.js writes its own PID file to ~/.clawpal/watchdog/
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn remote_stop_watchdog(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    let pid_raw = pool.sftp_read(&host_id, "~/.clawpal/watchdog/watchdog.pid").await;
+    if let Ok(pid_str) = pid_raw {
+        let _ = pool.exec(&host_id, &format!("kill {} 2>/dev/null", pid_str.trim())).await;
+    }
+    let _ = pool.exec(&host_id, "rm -f ~/.clawpal/watchdog/watchdog.pid").await;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn remote_uninstall_watchdog(pool: State<'_, SshConnectionPool>, host_id: String) -> Result<bool, String> {
+    // Stop first
+    let pid_raw = pool.sftp_read(&host_id, "~/.clawpal/watchdog/watchdog.pid").await;
+    if let Ok(pid_str) = pid_raw {
+        let _ = pool.exec(&host_id, &format!("kill {} 2>/dev/null", pid_str.trim())).await;
+    }
+    // Remove entire directory
+    let _ = pool.exec(&host_id, "rm -rf ~/.clawpal/watchdog").await;
+    Ok(true)
 }

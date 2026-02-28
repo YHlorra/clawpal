@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
-import { useInstance } from "@/lib/instance-context";
+import { useApi } from "@/lib/use-api";
 import { DiffViewer } from "../components/DiffViewer";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -12,31 +11,36 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import type { HistoryItem, PreviewResult } from "../lib/types";
 import { formatTime } from "@/lib/utils";
 
 export function History() {
   const { t } = useTranslation();
-  const { instanceId, isRemote, isConnected } = useInstance();
+  const ua = useApi();
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [message, setMessage] = useState("");
 
   const refreshHistory = () => {
-    if (isRemote) {
-      if (!isConnected) return;
-      return api.remoteListHistory(instanceId)
-        .then((resp) => setHistory(resp.items))
-        .catch(() => setMessage(t('history.failedLoad')));
-    }
-    return api.listHistory(50, 0)
+    return ua.listHistory()
       .then((resp) => setHistory(resp.items))
       .catch(() => setMessage(t('history.failedLoad')));
   };
 
   useEffect(() => {
     refreshHistory();
-  }, [instanceId, isRemote, isConnected]);
+  }, [ua]);
 
   // Build a map from snapshot ID to its display info for rollback references
   const historyMap = new Map(
@@ -71,7 +75,7 @@ export function History() {
                     </>
                   ) : (
                     <>
-                      <Badge variant="secondary">{item.recipeId || "manual"}</Badge>
+                      <Badge variant="secondary">{item.recipeId || t('history.manual')}</Badge>
                       <span className="text-muted-foreground">{item.source}</span>
                     </>
                   )}
@@ -86,9 +90,7 @@ export function History() {
                       size="sm"
                       onClick={async () => {
                         try {
-                          const p = isRemote
-                            ? await api.remotePreviewRollback(instanceId, item.id)
-                            : await api.previewRollback(item.id);
+                          const p = await ua.previewRollback(item.id);
                           setPreview(p);
                         } catch (err) {
                           setMessage(String(err));
@@ -98,26 +100,43 @@ export function History() {
                     >
                       {t('history.preview')}
                     </Button>
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      onClick={async () => {
-                        try {
-                          if (isRemote) {
-                            await api.remoteRollback(instanceId, item.id);
-                          } else {
-                            await api.rollback(item.id);
-                          }
-                          setMessage(t('history.rollbackCompleted'));
-                          await refreshHistory();
-                        } catch (err) {
-                          setMessage(String(err));
-                        }
-                      }}
-                      disabled={!item.canRollback}
-                    >
-                      {t('history.rollbackBtn')}
-                    </Button>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          disabled={!item.canRollback}
+                        >
+                          {t('history.rollbackBtn')}
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>{t('history.rollbackConfirmTitle')}</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            {t('history.rollbackConfirmDescription')}
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>{t('config.cancel')}</AlertDialogCancel>
+                          <AlertDialogAction
+                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                            onClick={async () => {
+                              try {
+                                const p = await ua.previewRollback(item.id);
+                                const label = `Rollback to ${item.recipeId || formatTime(item.createdAt)}`;
+                                await ua.queueCommand(label, ["__rollback__", p.configAfter]);
+                                setMessage(t('history.rollbackQueued'));
+                              } catch (err) {
+                                setMessage(String(err));
+                              }
+                            }}
+                          >
+                            {t('history.rollbackBtn')}
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                   </div>
                 )}
               </CardContent>
